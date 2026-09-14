@@ -1,0 +1,7 @@
+build/
+_deps/
+*.so
+*.so.*
+__pycache__/
+*.pyc
+spmv_benchmark.json

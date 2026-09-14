@@ -1,0 +1,112 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# libtriton_jit already pulls googletest in; reuse that target rather than
+# fetching a second, possibly different, copy.
+if(NOT TARGET GTest::gtest_main)
+    include(FetchContent)
+    FetchContent_Declare(googletest
+        URL https://github.com/google/googletest/archive/refs/tags/v1.16.0.tar.gz)
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
+endif()
+
+# The tests compile the backend adaptor themselves. libflagsparse.so exports
+# only the C API (visibility=hidden), so linking against its internals is not
+# possible by design -- and should not be made possible just to run tests.
+add_library(flagsparse_testsupport STATIC common.cpp ${FLAGSPARSE_ADAPTOR_SRC})
+target_include_directories(flagsparse_testsupport
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
+           ${CMAKE_SOURCE_DIR}/include
+           ${CMAKE_SOURCE_DIR}/src
+           ${FLAGSPARSE_ADAPTOR_INCLUDES})
+target_link_libraries(flagsparse_testsupport PUBLIC flagsparse ${FLAGSPARSE_ADAPTOR_LIBS})
+
+# test_<operator>.cpp, one per API, in both directories (spec §6.2).
+# ctest names are "<phase>.<operator>" so `ctest -R accuracy` and `ctest -R spmv`
+# both select the way the spec documents.
+function(flagsparse_add_test phase op)
+    set(src "${CMAKE_CURRENT_SOURCE_DIR}/${phase}/test_${op}.cpp")
+    if(NOT EXISTS "${src}")
+        return()
+    endif()
+    set(target "test_${phase}_${op}")
+    add_executable(${target} "${src}")
+    target_link_libraries(${target} PRIVATE flagsparse_testsupport GTest::gtest_main)
+    set_target_properties(${target} PROPERTIES
+        OUTPUT_NAME "test_${op}"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/${phase}")
+    add_test(NAME "${phase}.${op}" COMMAND ${target})
+    set_tests_properties("${phase}.${op}" PROPERTIES TIMEOUT 900)
+endfunction()
+
+# Every operator in the spec's list. Files that do not exist yet are skipped,
+# so adding an operator is: drop in test_<op>.cpp, rebuild.
+set(FLAGSPARSE_OPS spmv spmm spsv spsm spgemm sddmm gather scatter)
+foreach(op ${FLAGSPARSE_OPS})
+    flagsparse_add_test(accuracy ${op})
+    flagsparse_add_test(benchmark ${op})
+endforeach()
+
+# ---------------------------------------------------------------------------
+# The Python operator suite, registered as ctest cases.
+#
+# These tests exercise the Triton kernels this library re-exports -- the same
+# kernels, on the same device, through the other front end. Running them from
+# here means ONE command covers both layers on whatever backend the build was
+# configured for, which is the case that actually matters: a kernel that does not
+# lower on an accelerator breaks the C API too, and finding that out from a
+# separate repository's test run is finding it out late.
+#
+# They are registered, not duplicated: the files stay in the FlagSparse
+# checkout, located through FLAGSPARSE_PYTHON_SRC (which points at its src/).
+#
+#   ctest -R pytest        the Python suite only
+#   ctest -R accuracy      the C API accuracy tests only
+#   ctest -R spmv          both layers for one operator
+# ---------------------------------------------------------------------------
+option(FLAGSPARSE_CTEST_PYTEST "Register the Python operator suite as ctest cases" ON)
+
+if(FLAGSPARSE_CTEST_PYTEST AND FLAGSPARSE_PYTHON_SRC)
+    get_filename_component(_fs_py_root "${FLAGSPARSE_PYTHON_SRC}" DIRECTORY)
+    set(_fs_pytest_dir "${_fs_py_root}/tests/pytest")
+    if(EXISTS "${_fs_pytest_dir}")
+        find_package(Python COMPONENTS Interpreter QUIET)
+        if(Python_Interpreter_FOUND)
+            file(GLOB _fs_pytest_files "${_fs_pytest_dir}/test_*.py")
+            foreach(_file ${_fs_pytest_files})
+                get_filename_component(_stem "${_file}" NAME_WE)
+                string(REGEX REPLACE "^test_" "" _case "${_stem}")
+                string(REGEX REPLACE "_accuracy$" "" _case "${_case}")
+                add_test(NAME "pytest.${_case}"
+                         COMMAND "${Python_EXECUTABLE}" -m pytest -q "${_file}")
+                # PYTHONPATH so the suite imports the SAME source tree the C
+                # library's kernels are re-exported from -- an installed wheel
+                # would silently test a different copy.
+                set_tests_properties("pytest.${_case}" PROPERTIES
+                    TIMEOUT 3600
+                    ENVIRONMENT "PYTHONPATH=${FLAGSPARSE_PYTHON_SRC}")
+            endforeach()
+            list(LENGTH _fs_pytest_files _fs_pytest_count)
+            message(STATUS
+                "ctest: ${_fs_pytest_count} Python operator suites from ${_fs_pytest_dir}")
+        else()
+            message(STATUS "ctest: no Python interpreter; skipping the pytest suites")
+        endif()
+    else()
+        message(STATUS
+            "ctest: ${_fs_pytest_dir} not found; skipping the pytest suites "
+            "(set -DFLAGSPARSE_PYTHON_SRC to the FlagSparse checkout's src/)")
+    endif()
+endif()
