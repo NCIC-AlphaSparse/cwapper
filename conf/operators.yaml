@@ -38,6 +38,19 @@ performance_baseline:
   rocm: hipsparse     # wired: ctest/baseline/rocm, not yet compiled on a DCU box
   default: none
 
+# REPORTING SCOPE. `reporting` says whether a variant belongs to the delivery
+# list (算子列表注册修改.xlsx, "新算子列表" column) or is merely retained.
+#
+#   delivery  in the delivery list; appears in the default report.
+#   retained  implemented and covered by ctest/accuracy, but NOT in the delivery
+#             list. Still built and still tested -- dropping it from the manifest
+#             would orphan tests that exist and pass. It is filtered out of the
+#             default report instead.
+#
+# `delivery_dtypes` narrows it when only some dtypes are in the list (spsm_csr
+# delivers f32/f64 while the kernel also does complex). Absent means "all of
+# `dtypes`".
+
 operators:
   - id: gather
     zhiyuan_name: Gather
@@ -45,13 +58,16 @@ operators:
     c_api: [flagsparseGather]
     python_impl: [flagsparse_gather]
     formats: [sparse_vector]
-    dtypes: [f16, bf16, f32, f64, c64, c128]
+    # f16 is in the delivery list; bf16 is supported by the kernel but is not
+    # part of it, so it is left out here rather than measured and then filtered.
+    dtypes: [f16, f32, f64, c64, c128]
     index_types: [int]
     kernel_module: flagsparse_codegen/gather_scatter.py
     kernel_name: [gather_real_kernel, gather_complex_kernel]
     dispatch: src/ops/gather_scatter.cpp
     tests: [ctest/accuracy/test_gather.cpp, ctest/benchmark/test_gather.cpp]
     status: implemented
+    reporting: delivery
     notes: >
       Python side is complete. On MUSA the reference used by the Python test
       (advanced indexing) has no complex kernel; the C++ test's host reference
@@ -63,13 +79,16 @@ operators:
     c_api: [flagsparseScatter]
     python_impl: [flagsparse_scatter]
     formats: [sparse_vector]
-    dtypes: [f16, bf16, f32, f64, c64, c128]
+    # f16 is in the delivery list; bf16 is supported by the kernel but is not
+    # part of it, so it is left out here rather than measured and then filtered.
+    dtypes: [f16, f32, f64, c64, c128]
     index_types: [int]
     kernel_module: flagsparse_codegen/gather_scatter.py
     kernel_name: [scatter_real_kernel, scatter_complex_kernel]
     dispatch: src/ops/gather_scatter.cpp
     tests: [ctest/accuracy/test_scatter.cpp, ctest/benchmark/test_scatter.cpp]
     status: implemented
+    reporting: delivery
 
   - id: spmv_csr
     zhiyuan_name: SpMV_CSR
@@ -86,6 +105,7 @@ operators:
     dispatch: src/ops/spmv.cpp
     tests: [ctest/accuracy/test_spmv.cpp, ctest/benchmark/test_spmv.cpp]
     status: implemented
+    reporting: delivery
 
   - id: spmv_coo
     zhiyuan_name: SpMV_COO
@@ -103,6 +123,7 @@ operators:
     dispatch: src/ops/spmv.cpp
     tests: [ctest/accuracy/test_spmv.cpp, ctest/benchmark/test_spmv.cpp]
     status: implemented
+    reporting: delivery
     notes: >
       The deterministic segment route, run with SEG_IS_ROW=True so seg_starts is
       a full row-offsets array and a row with no nonzeros still picks up beta*y.
@@ -125,6 +146,7 @@ operators:
     dispatch: src/ops/spmv.cpp
     tests: [ctest/accuracy/test_spmv.cpp, ctest/benchmark/test_spmv.cpp]
     status: implemented
+    reporting: retained
     notes: >
       The only format here with all three directions. trans/conj_trans are
       deterministic (one program per column) and fold alpha and beta into the
@@ -148,6 +170,7 @@ operators:
     dispatch: src/ops/spmv.cpp
     tests: [ctest/accuracy/test_spmv.cpp, ctest/benchmark/test_spmv.cpp]
     status: implemented
+    reporting: retained
     notes: >
       Square blocks only: the kernel uses one BLOCK_DIM for both block extents,
       so a non-square block or ORDER_COL is refused rather than mis-indexed.
@@ -169,6 +192,7 @@ operators:
     dispatch: src/ops/spmv.cpp
     tests: [ctest/accuracy/test_spmv.cpp, ctest/benchmark/test_spmv.cpp]
     status: implemented
+    reporting: retained
     notes: >
       Selected by FLAGSPARSE_SPMV_COO_ALG2. Nothing is converted or copied: a
       row-sorted COO's column indices and values already ARE the CSR arrays, and
@@ -193,6 +217,7 @@ operators:
     dispatch: src/ops/spmm.cpp
     tests: [ctest/accuracy/test_spmm.cpp, ctest/benchmark/test_spmm.cpp]
     status: implemented
+    reporting: delivery
     notes: >
       Both dense operands carry explicit strides, so FLAGSPARSE_ORDER_COL and
       op(B) = B^T are the same kernel with different strides -- the column-major
@@ -219,6 +244,7 @@ operators:
     dispatch: src/ops/spmm.cpp
     tests: [ctest/accuracy/test_spmm.cpp, ctest/benchmark/test_spmm.cpp]
     status: implemented
+    reporting: delivery
     notes: >
       The rowrun route only. Unlike CSR this one needs scratch:
       flagsparseSpMM_bufferSize reports rows + 1 int32 for a row-offsets array,
@@ -277,6 +303,7 @@ operators:
     dispatch: src/ops/spgemm.cpp
     tests: [ctest/accuracy/test_spgemm.cpp, ctest/benchmark/test_spgemm.cpp]
     status: implemented
+    reporting: delivery
     notes: >
       The only operator whose result SIZE is discovered rather than given, so it
       follows cuSPARSE's five-call dance exactly. flagsparseCsrSetPointers had to
@@ -305,8 +332,16 @@ operators:
     kernel_module: flagsparse_codegen/sddmm_csr.py
     kernel_name: [sddmm_csr_real, _row_ids_kernel]
     dispatch: src/ops/sddmm.cpp
+    # The delivery list asks for c32/c64 here too, but there is no complex SDDMM
+    # kernel: flagsparse_sddmm_csr rejects them with "x dtype must be
+    # torch.float32 or torch.float64" (measured 2026-09-15). Recording the gap
+    # instead of listing the dtypes keeps `dtypes` truthful about the kernel --
+    # listing them would generate variants that fail at runtime and read as a
+    # regression rather than as work not yet done.
+    delivery_gaps: [c64, c128]
     tests: [ctest/accuracy/test_sddmm.cpp, ctest/benchmark/test_sddmm.cpp]
     status: implemented
+    reporting: delivery
     notes: >
       The one operator whose kernel already spoke cuSPARSE -- alpha, beta and
       HAS_IN were already there, so nothing had to be added to it. It needs one
@@ -333,6 +368,7 @@ operators:
     dispatch: src/ops/spsv.cpp
     tests: [ctest/accuracy/test_spsv.cpp, ctest/benchmark/test_spsv.cpp]
     status: implemented
+    reporting: delivery
     notes: >
       The chain-wave route: workers take rows from an atomic counter and spin on
       a per-row ready flag, so one launch solves the system and no level table is
@@ -367,6 +403,7 @@ operators:
     dispatch: src/ops/spsv.cpp
     tests: [ctest/accuracy/test_spsv.cpp, ctest/benchmark/test_spsv.cpp]
     status: implemented
+    reporting: delivery
     notes: >
       No second kernel and no converted copy: _analysis builds the row-offsets
       array into the second half of the scratch, and a row-sorted COO plus that
@@ -393,6 +430,7 @@ operators:
     dispatch: src/ops/spsv.cpp
     tests: [ctest/accuracy/test_spsv.cpp, ctest/benchmark/test_spsv.cpp]
     status: implemented
+    reporting: retained
     notes: >
       No cuSPARSE counterpart, so FLAGSPARSE_SPSV_SELL_ALG1/_ALG2 are FlagSparse's
       own ids and had to be added to the public enum. ALG1 is one program per row
@@ -454,6 +492,8 @@ operators:
     dispatch: src/ops/spsm.cpp
     tests: [ctest/accuracy/test_spsm.cpp, ctest/benchmark/test_spsm.cpp]
     status: implemented
+    reporting: delivery
+    delivery_dtypes: [f32, f64]
     notes: >
       Polling route: one program per (row, RHS tile), spinning on a per-(tile,
       row) done flag. Unlike SpSV it does not care about column order -- it
@@ -479,6 +519,7 @@ operators:
     dispatch: src/ops/spsm.cpp
     tests: [ctest/accuracy/test_spsm.cpp, ctest/benchmark/test_spsm.cpp]
     status: implemented
+    reporting: retained
     notes: >
       Same treatment as SpSV COO: _analysis builds a row-offsets array after the
       solver's own scratch, and the CSR kernel runs over that view. No second

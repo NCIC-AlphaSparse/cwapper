@@ -67,6 +67,12 @@ struct Scratch {
 
 bool map_dtype(flagsparseDataType_t t, FS_DT_TYPE* out) {
     switch (t) {
+        // Half is mapped for the operators that take it (gather/scatter move
+        // bytes and do no arithmetic). An operator whose vendor entry point
+        // rejects fp16 returns its own status, which becomes a blank speedup
+        // with that reason -- better than declining here and reporting the
+        // dtype as unmappable when it is the operator, not the type.
+        case FLAGSPARSE_R_16F: *out = FS_DT(R_16F); return true;
         case FLAGSPARSE_R_32F: *out = FS_DT(R_32F); return true;
         case FLAGSPARSE_R_64F: *out = FS_DT(R_64F); return true;
         case FLAGSPARSE_C_32F: *out = FS_DT(C_32F); return true;

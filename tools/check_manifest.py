@@ -229,6 +229,21 @@ def main():
         print(f"  {n} disagreements\n" if n else "  manifest and rows agree\n")
         drift += n
 
+    print("== delivery scope ==")
+    deliv = gaps = 0
+    for op in impl:
+        if op.get("reporting") != "delivery":
+            continue
+        narrow = op.get("delivery_dtypes")
+        dts = narrow if narrow else (op.get("dtypes") or [])
+        deliv += len(op.get("formats") or []) * len(dts)
+        for g in op.get("delivery_gaps") or []:
+            gaps += 1
+            print(f"  GAP  {op['id']:<22} {g}  declared in the delivery list, "
+                  f"no kernel")
+    print(f"  {deliv} delivery variants generated, {gaps} asked for but "
+          f"not implemented ({deliv + gaps} in the delivery list)\n")
+
     print("== summary ==")
     print(f"  {drift} disagreement(s) between the manifest and the repo")
     if drift and args.strict:

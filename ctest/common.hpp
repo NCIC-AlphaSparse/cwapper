@@ -206,10 +206,22 @@ struct BenchRow {
     double baseline_ms = 0.0;
     double speedup = 0.0;
 
-    // "pass" | "fail" | "unchecked". Judged against the CPU fp64 oracle, never
-    // against the baseline -- see baseline/baseline.hpp.
+    // "pass" | "pass_relaxed" | "fail" | "unchecked". Judged against the CPU fp64
+    // oracle, never against the baseline -- see baseline/baseline.hpp.
+    //
+    // pass_relaxed is spec 6.3.1 and is NOT a softer pass handed out on request:
+    // it requires that the VENDOR baseline also failed at the strict tolerance on
+    // this matrix, which is the evidence that the matrix is ill-conditioned rather
+    // than that we are wrong. Without a baseline it is never awarded.
     std::string accuracy = "unchecked";
-    double error_ratio = 0.0;
+    double error_ratio = 0.0;          // at the strict tolerance
+    double relaxed_error_ratio = 0.0;  // at spec 6.3.1's relaxed tolerance
+
+    // The baseline's own agreement with the same fp64 oracle: "pass" | "fail" |
+    // "unchecked". A speedup over a baseline that did not compute the right
+    // answer is not a speedup, and this is what makes that visible.
+    std::string baseline_accuracy = "unchecked";
+    double baseline_error_ratio = 0.0;
 
     // "ok" | "unavailable" | "failed". When not ok, baseline_detail says why and
     // the speedup column stays blank.
@@ -251,16 +263,24 @@ class BenchReport {
     // corpus it was given.
     //
     //   once   : runs the operator (timed, and leaves its result in place)
-    //   verify : error ratio of that result against the CPU fp64 oracle;
-    //            <= 1 passes, per spec 6.3. Return a negative value to declare
-    //            the check not applicable, which records accuracy="unchecked"
-    //            and withholds the speedup.
+    //   verify : error ratio of whatever is CURRENTLY in the output buffer,
+    //            against the CPU fp64 oracle, at the strict tolerance (false) or
+    //            spec 6.3.1's relaxed one (true). <= 1 passes. Return a negative
+    //            value to declare the check not applicable, which records
+    //            accuracy="unchecked" and withholds the speedup.
+    //            It is called again AFTER the baseline runs, to judge the
+    //            baseline's own answer -- hence "currently in the buffer".
     //   base   : runs the vendor baseline; may report unavailable, which is a
     //            recorded fact and not a failure.
+    //   baseline_writes_output : false when the baseline does not leave its
+    //            result where verify can see it (SpGEMM allocates its own C and
+    //            frees it). Then baseline_accuracy stays "unchecked" instead of
+    //            re-reading OUR result and calling the baseline correct.
     bool measure_vs_baseline(
         BenchRow row, const std::function<flagsparseStatus_t()>& once,
-        const std::function<double()>& verify,
-        const std::function<baseline::Status(baseline::Timing*)>& base, double flops);
+        const std::function<double(bool)>& verify,
+        const std::function<baseline::Status(baseline::Timing*)>& base, double flops,
+        bool baseline_writes_output = true);
 
     // Record a case that was never measured -- no descriptor, unsupported shape.
     void skip(BenchRow row, const std::string& status, const std::string& detail);

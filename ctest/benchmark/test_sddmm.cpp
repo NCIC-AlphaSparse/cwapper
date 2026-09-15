@@ -95,7 +95,7 @@ TEST(SddmmBenchmark, CsrOverCorpus) {
                            std::to_string(k) + "_" + entry.name;
                 row.tag("operator", v->op)
                    .tag("matrix", entry.name).tag("format", "csr").tag("dtype", v->dtype)
-                   .tag("corpus", corpus_tag())
+                   .tag("corpus", corpus_tag()).tag("reporting", v->reporting)
                    .num("rows", static_cast<double>(A.rows))
                    .num("cols", static_cast<double>(A.cols))
                    .num("nnz", static_cast<double>(A.nnz))
@@ -153,7 +153,7 @@ TEST(SddmmBenchmark, CsrOverCorpus) {
                                                FLAGSPARSE_SDDMM_ALG_DEFAULT,
                                                scratch.get());
                     },
-                    [&]() { return ratio_against(values.get(), ref, dt); },
+                    [&](bool relaxed) { return ratio_against(values.get(), ref, dt, relaxed); },
                     [&](baseline::Timing* t) {
                         return baseline::sddmm_csr(bA, B.get(), k, k, D.get(), A.cols,
                                                    sc.alpha(dt), sc.beta(dt),

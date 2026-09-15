@@ -76,7 +76,7 @@ TEST(SpsvBenchmark, CsrOverCorpus) {
             row.tag("operator", v->op)
                .tag("matrix", entry.name).tag("format", v->format)
                .tag("dtype", v->dtype)
-               .tag("corpus", corpus_tag()).tag("fill", "lower").tag("diag", "non_unit")
+               .tag("corpus", corpus_tag()).tag("reporting", v->reporting).tag("fill", "lower").tag("diag", "non_unit")
                .num("rows", static_cast<double>(L.rows))
                .num("nnz", static_cast<double>(L.nnz));
             trace("spsv", entry.name, v->dtype, L);
@@ -165,7 +165,7 @@ TEST(SpsvBenchmark, CsrOverCorpus) {
                                                 vecY, dt, FLAGSPARSE_SPSV_ALG_DEFAULT,
                                                 descr);
                 },
-                [&]() { return ratio_against(y.get(), ref, dt); },
+                [&](bool relaxed) { return ratio_against(y.get(), ref, dt, relaxed); },
                 [&](baseline::Timing* t) {
                     return baseline::spsv_csr(bA, x.get(), y.get(), sc.alpha(dt), fill,
                                               diag, NT, BenchReport::kWarmup,

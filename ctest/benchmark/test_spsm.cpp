@@ -88,7 +88,7 @@ TEST(SpsmBenchmark, CsrOverCorpus) {
                            std::to_string(n) + "_" + entry.name;
                 row.tag("operator", v->op)
                    .tag("matrix", entry.name).tag("format", "csr")
-                   .tag("dtype", v->dtype).tag("corpus", corpus_tag())
+                   .tag("dtype", v->dtype).tag("corpus", corpus_tag()).tag("reporting", v->reporting)
                    .tag("fill", "lower").tag("diag", "non_unit")
                    .num("rows", static_cast<double>(L.rows))
                    .num("nnz", static_cast<double>(L.nnz))
@@ -168,7 +168,7 @@ TEST(SpsmBenchmark, CsrOverCorpus) {
                                                     matA, matB, matC, dt,
                                                     FLAGSPARSE_SPSM_ALG_DEFAULT, descr);
                     },
-                    [&]() { return ratio_against(C.get(), ref, dt); },
+                    [&](bool relaxed) { return ratio_against(C.get(), ref, dt, relaxed); },
                     [&](baseline::Timing* t) {
                         return baseline::spsm_csr(bA, B.get(), n, L.rows, C.get(),
                                                   L.rows, sc.alpha(dt), fill, diag, NT,

@@ -75,7 +75,7 @@ TEST(SpmvBenchmark, CsrOverCorpus) {
                        entry.name;
             row.tag("operator", v->op)
                .tag("matrix", entry.name).tag("format", v->format).tag("dtype", v->dtype)
-               .tag("corpus", corpus_tag())
+               .tag("corpus", corpus_tag()).tag("reporting", v->reporting)
                .num("rows", static_cast<double>(A.rows))
                .num("cols", static_cast<double>(A.cols))
                .num("nnz", static_cast<double>(A.nnz));
@@ -142,7 +142,7 @@ TEST(SpmvBenchmark, CsrOverCorpus) {
                                           sc.alpha(dt), matA, vecX, sc.beta(dt), vecY,
                                           dt, FLAGSPARSE_SPMV_ALG_DEFAULT, scratch.get());
                 },
-                [&]() { return ratio_against(y.get(), ref, dt); },
+                [&](bool relaxed) { return ratio_against(y.get(), ref, dt, relaxed); },
                 [&](baseline::Timing* t) {
                     return baseline::spmv_csr(bA, x.get(), y.get(), sc.alpha(dt),
                                               sc.beta(dt),

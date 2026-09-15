@@ -93,7 +93,7 @@ TEST(SpgemmBenchmark, CsrOverCorpus) {
             row.name = std::string("spgemm_csr_") + v->dtype + "_" + entry.name;
             row.tag("operator", v->op)
                .tag("matrix", entry.name).tag("format", "csr").tag("dtype", v->dtype)
-               .tag("corpus", corpus_tag())
+               .tag("corpus", corpus_tag()).tag("reporting", v->reporting)
                .num("rows", static_cast<double>(A.rows))
                .num("nnz", static_cast<double>(A.nnz));
             trace("spgemm", entry.name, v->dtype, A);
@@ -184,7 +184,7 @@ TEST(SpgemmBenchmark, CsrOverCorpus) {
                                                  matB, sc.beta(dt), matC, dt,
                                                  FLAGSPARSE_SPGEMM_DEFAULT, descr);
                 },
-                [&]() -> double {
+                [&](bool relaxed) -> double {
                     if (cnnz > kVerifyNnzBudget) return -1.0;  // unchecked
                     CsrMatrix C;
                     C.rows = cr; C.cols = cc; C.nnz = cnnz;
@@ -199,14 +199,20 @@ TEST(SpgemmBenchmark, CsrOverCorpus) {
                             FLAGSPARSE_STATUS_SUCCESS) return 1e30;
                     C.values = read_back(c_val.get(), static_cast<std::size_t>(cnnz), dt);
                     if (cnnz > 0 && C.values.empty()) return 1e30;
-                    return max_error_ratio(host_spmv(C, x), ref, default_tolerance(dt));
+                    return max_error_ratio(host_spmv(C, x), ref,
+                                           relaxed ? relaxed_tolerance(dt)
+                                                   : default_tolerance(dt));
                 },
                 [&](baseline::Timing* t) {
                     return baseline::spgemm_csr(bA, sc.alpha(dt), sc.beta(dt),
                                                 BenchReport::kWarmup,
                                                 BenchReport::kIters, t);
                 },
-                0.0);
+                0.0,
+                // The baseline owns C's buffers internally and frees them, so our
+                // result is what is still in `c_val` afterwards. Verifying there
+                // would re-read OUR answer and call the baseline correct.
+                /*baseline_writes_output=*/false);
             teardown();
         }
     }

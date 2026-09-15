@@ -82,15 +82,6 @@ TEST(ScatterBenchmark, SpVecOverCorpus) {
         }
 
         for (const registry::Variant* v : declared) {
-            // fp16/bf16 ARE dispatched by src/core/dtype.cpp, but this sweep's
-            // host side only widens through float/double -- the gap is the
-            // half-precision conversion in sweep.hpp, not the operator.
-            if (std::string(v->dtype) == "f16" || std::string(v->dtype) == "bf16") {
-                report_unimplemented(g_report, *v,
-                    "sweep.hpp has no half-precision host conversion yet "
-                    "(the dispatch supports it: src/core/dtype.cpp)");
-                continue;
-            }
             const auto dt = v->dt;
             BenchRow row;
             row.name = std::string("scatter_spvec_") + v->dtype + "_" + entry.name;
@@ -99,7 +90,7 @@ TEST(ScatterBenchmark, SpVecOverCorpus) {
                                  (2.0 * static_cast<double>(elem_bytes(dt)) +
                                   static_cast<double>(sizeof(int32_t)));
             row.tag("matrix", entry.name).tag("format", "spvec").tag("operator", v->op).tag("dtype", v->dtype)
-               .tag("corpus", corpus_tag())
+               .tag("corpus", corpus_tag()).tag("reporting", v->reporting)
                .num("nnz", static_cast<double>(nnz))
                .num("size", static_cast<double>(dense))
                .num("bytes_moved", bytes);
@@ -127,7 +118,7 @@ TEST(ScatterBenchmark, SpVecOverCorpus) {
             g_report.measure_vs_baseline(
                 std::move(row),
                 [&]() { return flagsparseScatter(handle.h, vecX, vecY); },
-                [&]() { return ratio_against(d_dense.get(), ref, dt); },
+                [&](bool relaxed) { return ratio_against(d_dense.get(), ref, dt, relaxed); },
                 [&](baseline::Timing* t) {
                     return baseline::scatter(d_dense.get(), d_val.get(), d_idx.get(),
                                              nnz, dense, dt, BenchReport::kWarmup,

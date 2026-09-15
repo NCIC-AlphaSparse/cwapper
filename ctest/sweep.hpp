@@ -23,6 +23,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -42,6 +44,85 @@ struct Handle {
     Handle(const Handle&) = delete;
     Handle& operator=(const Handle&) = delete;
 };
+
+// Half-precision. Stored as 2 bytes, converted on the host because the C tests
+// deliberately carry no vendor headers (no __half, no cuda_fp16.h): the bit
+// twiddling below is the price of that, and it is worth paying -- pulling in a
+// vendor half type would make ctest unbuildable on a backend whose SDK spells it
+// differently.
+inline bool dtype_is_half(flagsparseDataType_t t) {
+    return t == FLAGSPARSE_R_16F || t == FLAGSPARSE_R_16BF;
+}
+
+// IEEE binary16 and bfloat16, both from a float. bf16 is just the top 16 bits of
+// the fp32 pattern, with round-to-nearest-even; fp16 needs a real conversion.
+inline uint16_t float_to_bf16(float f) {
+    uint32_t bits;
+    std::memcpy(&bits, &f, sizeof(bits));
+    const uint32_t rounding = 0x7fffu + ((bits >> 16) & 1u);
+    return static_cast<uint16_t>((bits + rounding) >> 16);
+}
+
+inline float bf16_to_float(uint16_t h) {
+    const uint32_t bits = static_cast<uint32_t>(h) << 16;
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+inline uint16_t float_to_fp16(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, sizeof(x));
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    int32_t exp = static_cast<int32_t>((x >> 23) & 0xffu) - 127 + 15;
+    uint32_t mant = x & 0x7fffffu;
+    if (exp <= 0) {
+        // Subnormal, not zero. fp16's smallest normal is ~6.1e-5 and its
+        // smallest subnormal ~6e-8, so flushing this whole range to zero loses
+        // four orders of magnitude -- a unit test caught 1e-5 becoming 0.
+        if (exp < -10) return static_cast<uint16_t>(sign);   // truly below range
+        mant |= 0x800000u;                                   // restore implicit 1
+        const int32_t shift = 14 - exp;                      // 24-bit mant -> 10-bit
+        const uint32_t sub = mant >> shift;
+        // Round to nearest even on the discarded bits.
+        const uint32_t rem = mant & ((1u << shift) - 1u);
+        const uint32_t half = 1u << (shift - 1);
+        uint32_t rounded = sub + ((rem > half || (rem == half && (sub & 1u))) ? 1u : 0u);
+        return static_cast<uint16_t>(sign | rounded);
+    }
+    if (exp >= 31) return static_cast<uint16_t>(sign | 0x7c00u);  // overflow to inf
+    // Round to nearest even on the 13 bits being discarded.
+    const uint32_t round = (mant & 0x1fffu) > 0x1000u ||
+                           ((mant & 0x1fffu) == 0x1000u && ((mant >> 13) & 1u));
+    uint16_t out = static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) |
+                                         (mant >> 13));
+    return static_cast<uint16_t>(out + round);
+}
+
+inline float fp16_to_float(uint16_t h) {
+    const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+    const uint32_t exp = (h >> 10) & 0x1fu;
+    const uint32_t mant = h & 0x3ffu;
+    uint32_t bits;
+    if (exp == 0) {
+        if (mant == 0) { bits = sign; }
+        else {
+            // Subnormal: normalise it into an fp32 exponent.
+            int32_t e = -1;
+            uint32_t m = mant;
+            do { m <<= 1; ++e; } while ((m & 0x400u) == 0);
+            bits = sign | (static_cast<uint32_t>(127 - 15 - e) << 23) |
+                   ((m & 0x3ffu) << 13);
+        }
+    } else if (exp == 31) {
+        bits = sign | 0x7f800000u | (mant << 13);
+    } else {
+        bits = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+    }
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+}
 
 inline bool dtype_is_64(flagsparseDataType_t t) {
     return t == FLAGSPARSE_R_64F || t == FLAGSPARSE_C_64F;
@@ -84,6 +165,14 @@ struct Scalars {
 inline DeviceBuffer upload_as(const std::vector<double>& src,
                               flagsparseDataType_t dt) {
     const std::size_t comp = dtype_components(dt);
+    if (dtype_is_half(dt)) {
+        std::vector<uint16_t> h(src.size(), 0);
+        for (std::size_t i = 0; i < src.size(); ++i) {
+            const float f = static_cast<float>(src[i]);
+            h[i] = (dt == FLAGSPARSE_R_16F) ? float_to_fp16(f) : float_to_bf16(f);
+        }
+        return DeviceBuffer::from(h);
+    }
     if (dtype_is_64(dt)) {
         std::vector<double> h(src.size() * comp, 0.0);
         for (std::size_t i = 0; i < src.size(); ++i) h[i * comp] = src[i];
@@ -97,6 +186,7 @@ inline DeviceBuffer upload_as(const std::vector<double>& src,
 
 // Bytes one dense element occupies at this dtype.
 inline std::size_t elem_bytes(flagsparseDataType_t dt) {
+    if (dtype_is_half(dt)) return sizeof(uint16_t);
     return (dtype_is_64(dt) ? sizeof(double) : sizeof(float)) * dtype_components(dt);
 }
 
@@ -107,6 +197,16 @@ inline std::vector<double> read_back(const void* dev, std::size_t count,
                                      flagsparseDataType_t dt) {
     const std::size_t comp = dtype_components(dt);
     std::vector<double> out(count);
+    if (dtype_is_half(dt)) {
+        std::vector<uint16_t> h(count);
+        if (to_host(h.data(), dev, h.size() * sizeof(uint16_t)) !=
+            FLAGSPARSE_STATUS_SUCCESS) return {};
+        for (std::size_t i = 0; i < count; ++i) {
+            out[i] = (dt == FLAGSPARSE_R_16F) ? fp16_to_float(h[i])
+                                              : bf16_to_float(h[i]);
+        }
+        return out;
+    }
     if (dtype_is_64(dt)) {
         std::vector<double> h(count * comp);
         if (to_host(h.data(), dev, h.size() * sizeof(double)) !=
@@ -121,14 +221,21 @@ inline std::vector<double> read_back(const void* dev, std::size_t count,
     return out;
 }
 
-// The error ratio of a device result against an fp64 oracle. A failed read-back
-// returns a value far above the pass threshold so the row records a failure
-// instead of a silent pass on an empty comparison.
+// The error ratio of a device result against an fp64 oracle, at either the strict
+// or the relaxed tolerance (spec 6.3 / 6.3.1). A failed read-back returns a value
+// far above the pass threshold so the row records a failure instead of a silent
+// pass on an empty comparison.
+//
+// BOTH RATIOS ARE NEEDED, not just the one that decides. Spec 6.3.1 only permits
+// the relaxed tolerance when the VENDOR baseline fails at strict too, and that is
+// not known until the baseline has run and overwritten the output buffer. So the
+// relaxed ratio has to be computed up front, while our result is still there.
 inline double ratio_against(const void* dev, const std::vector<double>& ref,
-                            flagsparseDataType_t dt) {
+                            flagsparseDataType_t dt, bool relaxed = false) {
     const std::vector<double> got = read_back(dev, ref.size(), dt);
     if (got.empty()) return 1e30;
-    return max_error_ratio(got, ref, default_tolerance(dt));
+    return max_error_ratio(got, ref,
+                           relaxed ? relaxed_tolerance(dt) : default_tolerance(dt));
 }
 
 // A deterministic dense operand. Fixed, not random: the oracle and the device
@@ -234,7 +341,7 @@ inline void report_unimplemented(BenchReport& rep, const registry::Variant& v,
     BenchRow row;
     row.name = std::string(v.op) + "_" + v.dtype + "_(no test path)";
     row.tag("operator", v.op).tag("format", v.format).tag("dtype", v.dtype)
-       .tag("corpus", corpus_tag());
+       .tag("corpus", corpus_tag()).tag("reporting", v.reporting);
     rep.skip(std::move(row), "not_implemented_in_test", why);
 }
 
@@ -255,6 +362,12 @@ inline const DtypeCase* all_dtypes(std::size_t* n) {
 
 // Per-matrix progress on stderr. A sweep over a large corpus runs for minutes,
 // and when one matrix takes the process down this line is what names it.
+// Tag a row with its delivery scope, so a report can filter on it without
+// re-deriving the manifest.
+inline void tag_scope(BenchRow& row, const registry::Variant& v) {
+    row.tag("reporting", v.reporting);
+}
+
 inline void trace(const char* op, const std::string& matrix, const char* dtype,
                   const CsrMatrix& A) {
     std::fprintf(stderr, "[%s] %s %s %lldx%lld nnz=%lld\n", op, matrix.c_str(), dtype,

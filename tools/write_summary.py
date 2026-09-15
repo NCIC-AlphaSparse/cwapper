@@ -126,6 +126,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bench-dir", type=pathlib.Path, required=True)
     ap.add_argument("--out", type=pathlib.Path, required=True)
+    ap.add_argument("--all", action="store_true",
+                    help="include retained variants; the default is the "
+                         "delivery list only (算子列表注册修改.xlsx)")
     args = ap.parse_args()
 
     files = sorted(args.bench_dir.glob("*_benchmark.json"))
@@ -141,7 +144,20 @@ def main():
         for r in rows:
             r["_backend"] = env.get("backend", "")
             r["_arch"] = str(env.get("arch", ""))
+        # Delivery scope. Rows from a build before the `reporting` tag existed
+        # have no such key; treating those as delivery would silently fold the
+        # retained variants into the headline numbers, so they are EXCLUDED and
+        # counted, and the run says so rather than reporting a wrong total.
+        if not args.all:
+            untagged = [r for r in rows if "reporting" not in r]
+            if untagged:
+                print(f"  {path.name}: {len(untagged)} rows carry no `reporting` "
+                      f"tag (built before it existed) -- excluded; rerun that "
+                      f"operator, or pass --all")
+            rows = [r for r in rows if r.get("reporting") == "delivery"]
         all_rows.extend(rows)
+        if not rows:
+            continue
 
         # ---- performance: dtype -> shape -> {base, gems, speedup}
         data = {}

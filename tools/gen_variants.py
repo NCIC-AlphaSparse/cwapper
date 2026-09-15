@@ -66,6 +66,10 @@ def main():
             if "benchmark/test_" in t:
                 fam = t.split("benchmark/test_")[1].replace(".cpp", "")
         fam = fam or family_of(op["id"])
+        # Delivery scope. `delivery_dtypes` narrows an operator that is in the
+        # list for only some of its dtypes; absent means all of them.
+        reporting = op.get("reporting", "retained")
+        narrow = op.get("delivery_dtypes")
         for f in fmts:
             ftag = FORMATS.get(f)
             if ftag is None:
@@ -75,7 +79,10 @@ def main():
                 if ent is None:
                     continue
                 enum, dtag = ent
-                rows.append((op["id"], fam, ftag, dtag, enum))
+                scope = reporting
+                if reporting == "delivery" and narrow and d not in narrow:
+                    scope = "retained"
+                rows.append((op["id"], fam, ftag, dtag, enum, scope))
 
     lines = [
         "// GENERATED from conf/operators.yaml by tools/gen_variants.py -- DO NOT EDIT.",
@@ -96,12 +103,14 @@ def main():
         "    const char* format;   // row tag, e.g. \"csc\"",
         "    const char* dtype;    // row tag, e.g. \"c32\"",
         "    flagsparseDataType_t dt;",
+        "    const char* reporting;  // \"delivery\" or \"retained\"",
         "};",
         "",
         "inline constexpr Variant kVariants[] = {",
     ]
-    for op, fam, ftag, dtag, enum in rows:
-        lines.append(f'    {{"{op}", "{fam}", "{ftag}", "{dtag}", {enum}}},')
+    for op, fam, ftag, dtag, enum, scope in rows:
+        lines.append(
+            f'    {{"{op}", "{fam}", "{ftag}", "{dtag}", {enum}, "{scope}"}},')
     lines += [
         "};",
         "",
@@ -114,10 +123,12 @@ def main():
     ]
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text("\n".join(lines))
-    fams = {}
-    for _, fam, _, _, _ in rows:
+    fams, scopes = {}, {}
+    for _, fam, _, _, _, scope in rows:
         fams[fam] = fams.get(fam, 0) + 1
+        scopes[scope] = scopes.get(scope, 0) + 1
     print(f"variants: {len(rows)} from {args.manifest.name} -> {args.out.name}")
+    print("  " + "  ".join(f"{k}={v}" for k, v in sorted(scopes.items())))
     for f, n in sorted(fams.items()):
         print(f"  {f:<10}{n}")
 

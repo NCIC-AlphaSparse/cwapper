@@ -58,11 +58,20 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bench-dir", type=pathlib.Path, required=True)
     ap.add_argument("--csv", type=pathlib.Path)
+    ap.add_argument("--all", action="store_true",
+                    help="include retained variants; default is the delivery "
+                         "list only (算子列表注册修改.xlsx)")
     ap.add_argument("--by-matrix", action="store_true",
                     help="one row per (variant, matrix) instead of aggregating")
     args = ap.parse_args()
 
     rows = load_rows(args.bench_dir)
+    # Default to the delivery list. Retained variants are measured and stored --
+    # they just do not belong in the headline report.
+    total_rows = len(rows)
+    if not args.all:
+        rows = [r for r in rows if r.get("reporting", "delivery") == "delivery"]
+    held = total_rows - len(rows)
     backend = rows[0]["_backend"] if rows else "?"
     arch = rows[0]["_arch"] if rows else "?"
     baseline = next((r.get("baseline") for r in rows if r.get("baseline")), "none")
@@ -78,8 +87,11 @@ def main():
     for r in rows:
         groups.setdefault(key(r), []).append(r)
 
-    print(f"backend {backend} ({arch})   baseline {baseline}   "
-          f"{len(groups)} variants from {len(rows)} rows\n")
+    scope = "all variants" if args.all else "delivery list"
+    print(f"backend {backend} ({arch})   baseline {baseline}   scope: {scope}")
+    print(f"{len(groups)} variants from {len(rows)} rows"
+          + (f"   ({held} rows held back as retained; --all to include)"
+             if held else "") + "\n")
 
     hdr = f"{'operator':<9}{'fmt':<6}{'dtype':<6}{'accuracy':>12}{'worst_err':>11}" \
           f"{'speedup':>10}{'range':>17}{'status':>10}"
