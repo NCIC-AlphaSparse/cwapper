@@ -328,7 +328,14 @@ FLAGSPARSE_EXPORT flagsparseStatus_t flagsparseSpMM(
     flagsparseDataType_t computeType, flagsparseSpMMAlg_t alg, void* externalBuffer);
 
 /* ------------------------------------------------------------------- SpSV */
-typedef enum { FLAGSPARSE_SPSV_ALG_DEFAULT = 0 } flagsparseSpSVAlg_t;
+typedef enum {
+    FLAGSPARSE_SPSV_ALG_DEFAULT = 0,
+    /* Sliced-ELL routes. A FlagSparse extension: cuSPARSE has no SELL format,
+       so these ids are ours and carry the same values the Python operator
+       library uses. ALG1 is one program per row, ALG2 one per slice. */
+    FLAGSPARSE_SPSV_SELL_ALG1   = 1,
+    FLAGSPARSE_SPSV_SELL_ALG2   = 2
+} flagsparseSpSVAlg_t;
 typedef struct flagsparseSpSVDescr* flagsparseSpSVDescr_t;
 
 FLAGSPARSE_EXPORT flagsparseStatus_t flagsparseSpSV_createDescr(flagsparseSpSVDescr_t* descr);

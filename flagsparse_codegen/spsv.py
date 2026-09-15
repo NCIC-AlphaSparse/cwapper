@@ -46,3 +46,44 @@ from flagsparse.sparse_operations.spsv import (  # noqa: E402,F401
 )
 
 __all__ = ["_spsv_csr_cw_kernel", "_spsv_csr_cw_kernel_complex"]
+
+
+# ---------------------------------------------------------------------------
+# Sliced-ELL. A FlagSparse extension with no cuSPARSE counterpart, so its
+# algorithm ids are FlagSparse's own (FLAGSPARSE_SPSV_SELL_ALG1 / _ALG2).
+#
+# Two routes over the same data and the same scratch:
+#
+#   alg1  one program per row, the same chain-wave shape as the CSR route.
+#   alg2  one program per SLICE, a lane per row. Advancing every row through its
+#         current SELL slot keeps the column loads coalesced, and the per-lane
+#         slot state lets an independent row continue instead of waiting for the
+#         most serialised row in its slice.
+#
+# LOWER TRIANGLES ONLY, all four kernels. The dependency test is a bare
+# ``col < row`` with no fill-mode constexpr, so an upper triangle would be
+# solved as though its entries were below the diagonal -- a plausible wrong
+# answer. The dispatch layer refuses UPPER rather than returning it.
+#
+# There is also no DIAG_EPS here, unlike the CSR route: a missing diagonal on a
+# NON_UNIT matrix divides by zero rather than being clamped. That is the
+# structure requirement the SELL format already states -- exactly one diagonal
+# entry per row, padding (-1) strictly trailing.
+#
+# Padding is ``col < 0``, and the kernels skip it, so a short row costs only its
+# own slots rather than the slice's widest.
+# ---------------------------------------------------------------------------
+
+from flagsparse.sparse_operations.spsv import (  # noqa: E402,F401
+    _spsv_sell_cw_kernel_alg1,
+    _spsv_sell_cw_kernel_alg1_complex,
+    _spsv_sell_slice_kernel_alg2,
+    _spsv_sell_slice_kernel_alg2_complex,
+)
+
+__all__ += [
+    "_spsv_sell_cw_kernel_alg1",
+    "_spsv_sell_cw_kernel_alg1_complex",
+    "_spsv_sell_slice_kernel_alg2",
+    "_spsv_sell_slice_kernel_alg2_complex",
+]

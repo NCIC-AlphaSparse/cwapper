@@ -168,7 +168,6 @@ flagsparseStatus_t validate(flagsparseHandle_t handle, flagsparseOperation_t opA
             // a prepare step this operator does not have. A caller who has CSC
             // arrays gets the transposed direction for free -- see run_csc.
             if (transposes(opA)) return FLAGSPARSE_STATUS_NOT_SUPPORTED;
-            if (is_complex(computeType)) return FLAGSPARSE_STATUS_NOT_SUPPORTED;
             break;
         case FLAGSPARSE_FORMAT_COO:
             if (transposes(opA)) return FLAGSPARSE_STATUS_NOT_SUPPORTED;
@@ -231,15 +230,21 @@ flagsparseStatus_t launch_csr_rowpar(flagsparseHandle_t handle, SpMatDescr* A,
     const int64_t segments =
         std::max<int64_t>(1, (max_row_nnz + kCsrBlockNnz - 1) / kCsrBlockNnz);
 
+    // The complex kernel is a separate function with its own name, not a dtype
+    // constexpr on the real one, so the only difference here is one extra scalar
+    // per side: Triton has no complex type, and alpha/beta arrive split into
+    // components the way the operands themselves are.
     std::string sig;
-    sig.reserve(128);
+    sig.reserve(160);
     sig += "*"; sig += ops.vt; sig += ":16,";   // data
     sig += "*"; sig += ops.it; sig += ":16,";   // indices
     sig += "*"; sig += offsets_type; sig += ":16,";   // indptr
     sig += "*"; sig += ops.vt; sig += ":16,";   // x
     sig += "*"; sig += ops.vt; sig += ":16,";   // y
-    sig += ops.vt; sig += ",";                  // alpha
-    sig += ops.vt; sig += ",";                  // beta
+    sig += ops.vt; sig += ",";                  // alpha (re)
+    if (ops.complex_op) { sig += ops.vt; sig += ","; }
+    sig += ops.vt; sig += ",";                  // beta (re)
+    if (ops.complex_op) { sig += ops.vt; sig += ","; }
     sig += "i32,";                              // n_rows
     sig += std::to_string(kCsrBlockNnz) + ",";
     sig += std::to_string(segments) + ",";
@@ -253,12 +258,15 @@ flagsparseStatus_t launch_csr_rowpar(flagsparseHandle_t handle, SpMatDescr* A,
     args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(X->values)));
     args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(Y->values)));
     push_scalar(ops, ops.alpha_re, &args);
+    if (ops.complex_op) push_scalar(ops, ops.alpha_im, &args);
     push_scalar(ops, ops.beta_re, &args);
+    if (ops.complex_op) push_scalar(ops, ops.beta_im, &args);
     args.push_back(jit::Arg::i(static_cast<std::int32_t>(n_rows)));
 
     std::string err;
     const flagsparseStatus_t st = jit::launch(
-        jit::codegen_module("spmv_csr.py"), "_spmv_csr_real_kernel", sig,
+        jit::codegen_module("spmv_csr.py"),
+        ops.complex_op ? "_spmv_csr_complex_kernel" : "_spmv_csr_real_kernel", sig,
         ctx(handle)->stream, n_rows, 1, 1, kCsrNumWarps, kCsrNumStages, args, &err);
     if (st != FLAGSPARSE_STATUS_SUCCESS) ctx(handle)->last_error = err;
     return st;
@@ -292,9 +300,9 @@ flagsparseStatus_t run_coo(flagsparseHandle_t handle, SpMatDescr* A,
     // COO_ALG2 = run the CSR row-parallel kernel over the offsets just built.
     // Nothing is converted or copied: a row-sorted COO's column indices and
     // values already ARE the CSR arrays, so the offsets are the only thing that
-    // was missing. Only the real kernel exists, so complex keeps the segment
-    // route -- same answer either way, which is what an alg hint promises.
-    if (to_csr && !ops.complex_op) {
+    // was missing. Complex goes through it too now that the CSR launcher picks
+    // the complex kernel by name.
+    if (to_csr) {
         return launch_csr_rowpar(handle, A, externalBuffer, "i32", A->rows,
                                  A->max_row_nnz < 0 ? 0 : A->max_row_nnz, X, Y, ops);
     }

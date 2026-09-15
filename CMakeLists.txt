@@ -134,6 +134,12 @@ target_link_libraries(flagsparse PRIVATE TritonJIT::triton_jit)
 # ------------------------------------------------------------------ backend
 add_subdirectory(src/adaptor)
 
+# -------------------------------------------------------------------- tools
+option(FLAGSPARSE_BUILD_TOOLS "Build the cross-operator corpus sweep" ON)
+if(FLAGSPARSE_BUILD_TOOLS)
+    add_subdirectory(tools)
+endif()
+
 # -------------------------------------------------------------------- tests
 if(FLAGSPARSE_BUILD_TESTS)
     enable_testing()

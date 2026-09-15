@@ -12,190 +12,180 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
-// Performance test for flagsparseSpSM, through the shared harness.
+// SpSM over the real-matrix corpus, against the vendor baseline.
 //
-// Same dependency chain as SpSV, but amortised over many right-hand sides: the
-// chain is walked once no matter how wide B is, so the interesting axis here is
-// n_rhs. It is also the axis that picks the RHS tile (next power of two, capped
-// at 1024) and with it the warp count, so a regression lands on one side of a
-// power of two and not the other.
-//
-// Two costs are deliberately inside the clock and one is outside. Analysis is
-// outside -- it extracts the diagonal, which depends only on the matrix. The
-// two strided copies that move B into the packed work array and the result back
-// out are INSIDE, because a caller pays them on every solve; hiding them would
-// report a solve this API cannot actually deliver.
+// Same operand construction and the same analysis-excluded timing as SpSV (see
+// benchmark/test_spsv.cpp); what this adds is the right-hand-side count. On this
+// box n=1 -> 32 measured as nearly free, which is the interesting property of a
+// triangular solve: the level schedule is the cost and it is shared across
+// columns, so the ratio against a vendor kernel should move with n. Sweeping n
+// is how that claim stays checked rather than remembered.
 
 #include <gtest/gtest.h>
 
-#include <sstream>
 #include <vector>
 
-#include "common.hpp"
+#include "baseline/baseline.hpp"
+#include "sweep.hpp"
 
 using namespace fstest;
 
 namespace {
 
-struct Handle {
-    flagsparseHandle_t h = nullptr;
-    Handle() { flagsparseCreate(&h); }
-    ~Handle() { if (h) flagsparseDestroy(h); }
-};
-
 BenchReport g_report("spsm");
 
-bool bench_one(flagsparseHandle_t handle, const char* name, int64_t n, int64_t n_rhs,
-               double density, flagsparseDataType_t dtype,
-               flagsparseOrder_t order = FLAGSPARSE_ORDER_ROW,
-               flagsparseFormat_t format = FLAGSPARSE_FORMAT_CSR) {
-    const TriMatrix T = random_triangular(n, density, true, false, 4242);
-    BenchRow row;
-    row.name = name;
-    row.tag("format", format == FLAGSPARSE_FORMAT_COO ? "coo" : "csr")
-       .tag("order", order == FLAGSPARSE_ORDER_COL ? "col" : "row")
-       .tag("dtype", dtype == FLAGSPARSE_R_64F ? "float64" : "float32")
-       .num("n", static_cast<double>(n))
-       .num("n_rhs", static_cast<double>(n_rhs))
-       .num("nnz", static_cast<double>(T.nnz()))
-       .num("density", density);
-
-    const std::size_t esize = (dtype == FLAGSPARSE_R_64F) ? sizeof(double) : sizeof(float);
-    DeviceBuffer d_val(static_cast<std::size_t>(T.nnz()) * esize);
-    if (dtype == FLAGSPARSE_R_64F) {
-        to_device(d_val.get(), T.values.data(), d_val.size());
-    } else {
-        const std::vector<float> v(T.values.begin(), T.values.end());
-        to_device(d_val.get(), v.data(), d_val.size());
-    }
-    DeviceBuffer d_col = DeviceBuffer::from(T.indices);
-    DeviceBuffer d_ptr = DeviceBuffer::from(T.indptr);
-    DeviceBuffer d_row = DeviceBuffer::from(coo_row_indices_of(T));
-    DeviceBuffer d_b(static_cast<std::size_t>(n * n_rhs) * esize);
-    DeviceBuffer d_c(static_cast<std::size_t>(n * n_rhs) * esize);
-    {
-        const std::vector<double> ones64(static_cast<std::size_t>(n * n_rhs), 1.0);
-        if (dtype == FLAGSPARSE_R_64F) {
-            to_device(d_b.get(), ones64.data(), d_b.size());
-        } else {
-            const std::vector<float> ones(ones64.begin(), ones64.end());
-            to_device(d_b.get(), ones.data(), d_b.size());
-        }
-    }
-
-    flagsparseSpMatDescr_t matA = nullptr;
-    flagsparseDnMatDescr_t matB = nullptr, matC = nullptr;
-    flagsparseSpSMDescr_t descr = nullptr;
-    const flagsparseStatus_t created =
-        (format == FLAGSPARSE_FORMAT_COO)
-            ? flagsparseCreateCoo(&matA, n, n, T.nnz(), d_row.get(), d_col.get(),
-                                  d_val.get(), FLAGSPARSE_INDEX_32I,
-                                  FLAGSPARSE_INDEX_BASE_ZERO, dtype)
-            : flagsparseCreateCsr(&matA, n, n, T.nnz(), d_ptr.get(), d_col.get(),
-                                  d_val.get(), FLAGSPARSE_INDEX_32I,
-                                  FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_BASE_ZERO,
-                                  dtype);
-    if (created != FLAGSPARSE_STATUS_SUCCESS) {
-        g_report.skip(row, "failed", status_name(created));
-        return false;
-    }
-    const flagsparseFillMode_t fill = FLAGSPARSE_FILL_MODE_LOWER;
-    const flagsparseDiagType_t diag = FLAGSPARSE_DIAG_TYPE_NON_UNIT;
-    flagsparseSpMatSetAttribute(matA, FLAGSPARSE_SPMAT_FILL_MODE, &fill, sizeof(fill));
-    flagsparseSpMatSetAttribute(matA, FLAGSPARSE_SPMAT_DIAG_TYPE, &diag, sizeof(diag));
-    const int64_t ld = (order == FLAGSPARSE_ORDER_ROW) ? n_rhs : n;
-    flagsparseCreateDnMat(&matB, n, n_rhs, ld, d_b.get(), dtype, order);
-    flagsparseCreateDnMat(&matC, n, n_rhs, ld, d_c.get(), dtype, order);
-    flagsparseSpSM_createDescr(&descr);
-
-    const double alpha_d = 1.0;
-    const float alpha_f = 1.0f;
-    const void* alpha = (dtype == FLAGSPARSE_R_64F) ? static_cast<const void*>(&alpha_d)
-                                                    : static_cast<const void*>(&alpha_f);
-    const auto NT = FLAGSPARSE_OPERATION_NON_TRANSPOSE;
-    const auto ALG = FLAGSPARSE_SPSM_ALG_DEFAULT;
-
-    bool measured = false;
-    size_t bufsz = 0;
-    const flagsparseStatus_t sized =
-        flagsparseSpSM_bufferSize(handle, NT, NT, alpha, matA, matB, matC, dtype, ALG,
-                                  descr, &bufsz);
-    if (sized != FLAGSPARSE_STATUS_SUCCESS) {
-        g_report.skip(row, sized == FLAGSPARSE_STATUS_NOT_SUPPORTED ? "not_supported"
-                                                                   : "failed",
-                      status_name(sized));
-        measured = (sized == FLAGSPARSE_STATUS_NOT_SUPPORTED);
-    } else {
-        DeviceBuffer scratch(bufsz);
-        row.num("scratch_bytes", static_cast<double>(bufsz));
-        const flagsparseStatus_t analysed =
-            flagsparseSpSM_analysis(handle, NT, NT, alpha, matA, matB, matC, dtype, ALG,
-                                    descr, scratch.get());
-        if (analysed != FLAGSPARSE_STATUS_SUCCESS) {
-            g_report.skip(row, analysed == FLAGSPARSE_STATUS_NOT_SUPPORTED
-                                   ? "not_supported" : "failed",
-                          std::string("analysis: ") + status_name(analysed));
-            measured = (analysed == FLAGSPARSE_STATUS_NOT_SUPPORTED);
-        } else {
-            measured = g_report.measure(
-                row,
-                [&] {
-                    return flagsparseSpSM_solve(handle, NT, NT, alpha, matA, matB, matC,
-                                                dtype, ALG, descr);
-                },
-                2.0 * static_cast<double>(T.nnz()) * static_cast<double>(n_rhs));
-        }
-    }
-
-    flagsparseSpSM_destroyDescr(descr);
-    flagsparseDestroyDnMat(matC);
-    flagsparseDestroyDnMat(matB);
-    flagsparseDestroySpMat(matA);
-    return measured;
-}
-
-class SpSMBenchmark : public ::testing::Test {
-  protected:
-    Handle handle;
-    void SetUp() override {
-        if (handle.h == nullptr) GTEST_SKIP() << "no accelerator available";
-        static bool announced = false;
-        if (!announced) { print_backend_banner(); announced = true; }
-    }
-};
-
-// The chain is walked once whatever n_rhs is, so this is where SpSM earns its
-// keep over repeated SpSV -- and where the RHS tile threshold shows up.
-TEST_F(SpSMBenchmark, RhsWidthSweep) {
-    for (int64_t k : {1, 8, 32, 64, 128, 512, 1024, 2048}) {
-        std::ostringstream name;
-        name << "nrhs_" << k;
-        EXPECT_TRUE(bench_one(handle.h, name.str().c_str(), 4096, k, 0.002,
-                              FLAGSPARSE_R_64F));
-    }
-}
-
-TEST_F(SpSMBenchmark, DepthSweep) {
-    for (int64_t n : {1024, 4096, 16384}) {
-        std::ostringstream name;
-        name << "n_" << n;
-        EXPECT_TRUE(bench_one(handle.h, name.str().c_str(), n, 32, 0.002,
-                              FLAGSPARSE_R_64F));
-    }
-}
-
-// Column-major B and C go through the same strided copy as row-major, so any
-// difference here is the copy's coalescing, not the solve's.
-TEST_F(SpSMBenchmark, LayoutFormatAndDtype) {
-    EXPECT_TRUE(bench_one(handle.h, "row_major", 4096, 32, 0.002, FLAGSPARSE_R_64F,
-                          FLAGSPARSE_ORDER_ROW));
-    EXPECT_TRUE(bench_one(handle.h, "col_major", 4096, 32, 0.002, FLAGSPARSE_R_64F,
-                          FLAGSPARSE_ORDER_COL));
-    EXPECT_TRUE(bench_one(handle.h, "fp32", 4096, 32, 0.002, FLAGSPARSE_R_32F));
-    EXPECT_TRUE(bench_one(handle.h, "coo", 4096, 32, 0.002, FLAGSPARSE_R_64F,
-                          FLAGSPARSE_ORDER_ROW, FLAGSPARSE_FORMAT_COO));
-    g_report.write();
-}
+constexpr int64_t kRhs[] = {1, 8, 32};
 
 }  // namespace
+
+TEST(SpsmBenchmark, CsrOverCorpus) {
+    Handle handle;
+    ASSERT_NE(handle.h, nullptr);
+    report_corpus_failures(g_report, "csr");
+
+    const Scalars sc;
+    const auto declared = variants_of("spsm");
+
+    for (const auto& entry : corpus()) {
+        const CsrMatrix L = lower_triangle(entry.A);
+        if (L.rows <= 0) {
+            g_report.skip(BenchRow{}.tag("matrix", entry.name).tag("format", "csr"),
+                          "skipped_shape", "empty triangle");
+            continue;
+        }
+        for (const int64_t n : kRhs) {
+            // B column-major (rows x n). Each column is solved independently, so
+            // the oracle is the per-column forward substitution.
+            const std::size_t count = static_cast<std::size_t>(L.rows) *
+                                      static_cast<std::size_t>(n);
+            const std::vector<double> b_col = dense_pattern(count);
+            std::vector<double> ref(count);
+            for (int64_t j = 0; j < n; ++j) {
+                std::vector<double> col(b_col.begin() + static_cast<long>(j * L.rows),
+                                        b_col.begin() +
+                                            static_cast<long>((j + 1) * L.rows));
+                const std::vector<double> sol = trsv_reference(L, col);
+                for (int64_t r = 0; r < L.rows; ++r) {
+                    ref[static_cast<std::size_t>(j) * L.rows + r] =
+                        sol[static_cast<std::size_t>(r)];
+                }
+            }
+
+            for (const registry::Variant* v : declared) {
+                if (std::string(v->format) != "csr") {
+                    if (n == kRhs[0]) {
+                        const std::string why =
+                            std::string("benchmark/test_spsm.cpp has no ") +
+                            v->format + " operand builder yet "
+                            "(accuracy coverage exists)";
+                        report_unimplemented(g_report, *v, why.c_str());
+                    }
+                    continue;
+                }
+                const auto dt = v->dt;
+                BenchRow row;
+                row.name = std::string("spsm_csr_") + v->dtype + "_n" +
+                           std::to_string(n) + "_" + entry.name;
+                row.tag("operator", v->op)
+                   .tag("matrix", entry.name).tag("format", "csr")
+                   .tag("dtype", v->dtype).tag("corpus", corpus_tag())
+                   .tag("fill", "lower").tag("diag", "non_unit")
+                   .num("rows", static_cast<double>(L.rows))
+                   .num("nnz", static_cast<double>(L.nnz))
+                   .num("n", static_cast<double>(n));
+                trace("spsm", entry.name, v->dtype, L);
+
+                DeviceBuffer indptr = DeviceBuffer::from(L.indptr);
+                DeviceBuffer indices = DeviceBuffer::from(L.indices);
+                DeviceBuffer values = upload_as(L.values, dt);
+                DeviceBuffer B = upload_as(b_col, dt);
+                DeviceBuffer C(count * elem_bytes(dt));
+                if (!indptr.get() || !indices.get() || !values.get() || !B.get() ||
+                    !C.get()) {
+                    g_report.skip(std::move(row), "skipped_memory",
+                                  "device allocation failed at n=" + std::to_string(n));
+                    continue;
+                }
+
+                flagsparseSpMatDescr_t matA = nullptr;
+                flagsparseDnMatDescr_t matB = nullptr, matC = nullptr;
+                if (flagsparseCreateCsr(&matA, L.rows, L.cols, L.nnz, indptr.get(),
+                                        indices.get(), values.get(),
+                                        FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_32I,
+                                        FLAGSPARSE_INDEX_BASE_ZERO, dt) !=
+                    FLAGSPARSE_STATUS_SUCCESS) {
+                    g_report.skip(std::move(row), "failed", "flagsparseCreateCsr failed");
+                    continue;
+                }
+                const flagsparseFillMode_t fill = FLAGSPARSE_FILL_MODE_LOWER;
+                const flagsparseDiagType_t diag = FLAGSPARSE_DIAG_TYPE_NON_UNIT;
+                flagsparseSpMatSetAttribute(matA, FLAGSPARSE_SPMAT_FILL_MODE, &fill,
+                                            sizeof(fill));
+                flagsparseSpMatSetAttribute(matA, FLAGSPARSE_SPMAT_DIAG_TYPE, &diag,
+                                            sizeof(diag));
+                flagsparseCreateDnMat(&matB, L.rows, n, L.rows, B.get(), dt,
+                                      FLAGSPARSE_ORDER_COL);
+                flagsparseCreateDnMat(&matC, L.rows, n, L.rows, C.get(), dt,
+                                      FLAGSPARSE_ORDER_COL);
+
+                const auto NT = FLAGSPARSE_OPERATION_NON_TRANSPOSE;
+                flagsparseSpSMDescr_t descr = nullptr;
+                flagsparseSpSM_createDescr(&descr);
+                std::size_t bufsz = 0;
+                flagsparseSpSM_bufferSize(handle.h, NT, NT, sc.alpha(dt), matA, matB,
+                                          matC, dt, FLAGSPARSE_SPSM_ALG_DEFAULT, descr,
+                                          &bufsz);
+                DeviceBuffer scratch(bufsz ? bufsz : 1);
+                auto teardown = [&]() {
+                    flagsparseSpSM_destroyDescr(descr);
+                    flagsparseDestroyDnMat(matB); flagsparseDestroyDnMat(matC);
+                    flagsparseDestroySpMat(matA);
+                };
+                if (!scratch.get()) {
+                    teardown();
+                    g_report.skip(std::move(row), "skipped_memory",
+                                  "SpSM scratch allocation failed");
+                    continue;
+                }
+                const flagsparseStatus_t an = flagsparseSpSM_analysis(
+                    handle.h, NT, NT, sc.alpha(dt), matA, matB, matC, dt,
+                    FLAGSPARSE_SPSM_ALG_DEFAULT, descr, scratch.get());
+                if (an != FLAGSPARSE_STATUS_SUCCESS) {
+                    teardown();
+                    g_report.skip(std::move(row),
+                                  an == FLAGSPARSE_STATUS_NOT_SUPPORTED
+                                      ? "not_supported" : "failed",
+                                  "SpSM_analysis declined this matrix");
+                    continue;
+                }
+
+                baseline::DeviceCsr bA{indptr.get(), indices.get(), values.get(),
+                                       L.rows, L.cols, L.nnz, dt};
+                g_report.measure_vs_baseline(
+                    std::move(row),
+                    [&]() {
+                        return flagsparseSpSM_solve(handle.h, NT, NT, sc.alpha(dt),
+                                                    matA, matB, matC, dt,
+                                                    FLAGSPARSE_SPSM_ALG_DEFAULT, descr);
+                    },
+                    [&]() { return ratio_against(C.get(), ref, dt); },
+                    [&](baseline::Timing* t) {
+                        return baseline::spsm_csr(bA, B.get(), n, L.rows, C.get(),
+                                                  L.rows, sc.alpha(dt), fill, diag, NT,
+                                                  BenchReport::kWarmup,
+                                                  BenchReport::kIters, t);
+                    },
+                    2.0 * static_cast<double>(L.nnz) * static_cast<double>(n));
+                teardown();
+            }
+        }
+    }
+    EXPECT_GT(g_report.size(), 0u);
+}
+
+int main(int argc, char** argv) {
+    ::testing::InitGoogleTest(&argc, argv);
+    const int rc = RUN_ALL_TESTS();
+    g_report.write();
+    return rc;
+}

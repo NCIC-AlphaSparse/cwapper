@@ -12,248 +12,210 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
-// Performance test for SpGEMM, through the shared harness.
+// SpGEMM (C = A*A) over the real-matrix corpus, against the vendor baseline.
 //
-// This operator is reported as THREE rows per case, not one, because its three
-// phases are different kinds of work and averaging them hides the interesting
-// part:
+// THE ORACLE IS INDIRECT, ON PURPOSE. Materialising A*A in fp64 on the host costs
+// more memory than the product itself for these matrices. But if C = A*A then
+// C*x == A*(A*x) for any x, and both sides of that are host SpMVs over vectors of
+// length rows -- cheap, and sensitive to a wrong value anywhere in C that x does
+// not happen to annihilate. A fixed non-degenerate x is used for the same reason
+// the dense operands elsewhere are fixed.
 //
-//   work_estimation  builds the per-row product counts. Host-side, O(nnz_A).
-//   compute          the counting kernel, then a host readback and prefix scan
-//                    that discovers C's nnz. The readback is a device sync by
-//                    construction -- the size is not knowable without it.
-//   copy             the fill kernel, then a per-row sort on the HOST to honour
-//                    cuSPARSE's sorted-CSR guarantee.
+// ONLY `copy` IS TIMED. The flow is stateful: workEstimation and compute discover
+// C's size and cannot be replayed independently, so the timed region is the phase
+// that materialises the result. The vendor baseline times its own copy phase for
+// the same reason, which keeps the ratio like-for-like. An earlier sweep of mine
+// reported this column without saying so; it says so now.
 //
-// That last one is a known cost, and splitting the phases is what makes it
-// visible rather than smeared into a single number. A device-side segmented sort
-// is the obvious improvement, and this is the row that would show it landing.
-//
-// Each phase is re-timed from a clean descriptor: the flow is stateful, so
-// running `copy` a hundred times without redoing `compute` would measure a
-// repeat of the last phase rather than the phase itself.
+// REAL DTYPES ONLY, matching the kernel's coverage.
 
 #include <gtest/gtest.h>
 
-#include <sstream>
 #include <vector>
 
-#include "common.hpp"
+#include "baseline/baseline.hpp"
+#include "sweep.hpp"
 
 using namespace fstest;
 
 namespace {
 
-struct Handle {
-    flagsparseHandle_t h = nullptr;
-    Handle() { flagsparseCreate(&h); }
-    ~Handle() { if (h) flagsparseDestroy(h); }
-};
-
 BenchReport g_report("spgemm");
 
-struct DeviceCsr {
-    DeviceBuffer ptr, col, val;
-    flagsparseSpMatDescr_t descr = nullptr;
-    ~DeviceCsr() { if (descr) flagsparseDestroySpMat(descr); }
-};
+// Reading C back and multiplying costs memory proportional to its nonzeros. Past
+// this the row is measured but recorded accuracy="unchecked", which withholds the
+// speedup rather than quietly averaging an unverified ratio into the geomean.
+constexpr int64_t kVerifyNnzBudget = 20'000'000;
 
-bool upload(const CsrMatrix& M, flagsparseDataType_t dtype, DeviceCsr* out) {
-    const std::vector<float> values(M.values.begin(), M.values.end());
-    out->ptr = DeviceBuffer::from(M.indptr);
-    out->col = DeviceBuffer::from(M.indices);
-    out->val = DeviceBuffer::from(values);
-    return flagsparseCreateCsr(&out->descr, M.rows, M.cols, M.nnz, out->ptr.get(),
-                               out->col.get(), out->val.get(), FLAGSPARSE_INDEX_32I,
-                               FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_BASE_ZERO, dtype)
-           == FLAGSPARSE_STATUS_SUCCESS;
-}
-
-// Scalar products the product would evaluate -- the honest denominator for a
-// GFLOPS column here, since nnz_C counts only what survived accumulation.
-double product_count(const CsrMatrix& A, const CsrMatrix& B) {
-    double total = 0.0;
-    for (int32_t k : A.indices) {
-        total += B.indptr[static_cast<std::size_t>(k) + 1] -
-                 B.indptr[static_cast<std::size_t>(k)];
-    }
-    return total;
-}
-
-void bench_one(flagsparseHandle_t handle, const char* name, int64_t m, int64_t k,
-               int64_t n, double density) {
-    const CsrMatrix A = random_csr(m, k, density, 11);
-    const CsrMatrix B = random_csr(k, n, density, 13);
-    const double products = product_count(A, B);
-    const auto NT = FLAGSPARSE_OPERATION_NON_TRANSPOSE;
-    const auto ALG = FLAGSPARSE_SPGEMM_DEFAULT;
-    const float one = 1.0f, zero = 0.0f;
-
-    const auto base_row = [&](const char* phase) {
-        BenchRow row;
-        row.name = std::string(name) + "_" + phase;
-        row.tag("phase", phase)
-           .tag("dtype", "float32")
-           .num("m", static_cast<double>(m))
-           .num("k", static_cast<double>(k))
-           .num("n", static_cast<double>(n))
-           .num("nnz_a", static_cast<double>(A.nnz))
-           .num("nnz_b", static_cast<double>(B.nnz))
-           .num("products", products)
-           .num("density", density);
-        return row;
-    };
-
-    DeviceCsr da, db;
-    if (!upload(A, FLAGSPARSE_R_32F, &da) || !upload(B, FLAGSPARSE_R_32F, &db)) {
-        g_report.skip(base_row("work_estimation"), "failed", "operand upload");
-        return;
-    }
-
-    // One full pass first: it decides whether this case runs at all, sizes the
-    // buffers, and tells us C's nnz for the report.
-    DeviceBuffer c_ptr_probe(static_cast<size_t>(m + 1) * sizeof(int32_t));
-    flagsparseSpMatDescr_t matC = nullptr;
-    if (flagsparseCreateCsr(&matC, m, n, 0, c_ptr_probe.get(), nullptr, nullptr,
-                            FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_32I,
-                            FLAGSPARSE_INDEX_BASE_ZERO, FLAGSPARSE_R_32F)
-        != FLAGSPARSE_STATUS_SUCCESS) {
-        g_report.skip(base_row("work_estimation"), "failed", "C descriptor");
-        return;
-    }
-    flagsparseSpGEMMDescr_t probe = nullptr;
-    flagsparseSpGEMM_createDescr(&probe);
-    size_t size1 = 0, size2 = 0;
-    flagsparseSpGEMM_workEstimation(handle, NT, NT, &one, da.descr, db.descr, &zero,
-                                    matC, FLAGSPARSE_R_32F, ALG, probe, &size1, nullptr);
-    DeviceBuffer buf1(size1);
-    flagsparseStatus_t st = flagsparseSpGEMM_workEstimation(
-        handle, NT, NT, &one, da.descr, db.descr, &zero, matC, FLAGSPARSE_R_32F, ALG,
-        probe, &size1, buf1.get());
-    if (st == FLAGSPARSE_STATUS_SUCCESS) {
-        flagsparseSpGEMM_compute(handle, NT, NT, &one, da.descr, db.descr, &zero, matC,
-                                 FLAGSPARSE_R_32F, ALG, probe, &size2, nullptr);
-    }
-    DeviceBuffer buf2(size2);
-    if (st == FLAGSPARSE_STATUS_SUCCESS) {
-        st = flagsparseSpGEMM_compute(handle, NT, NT, &one, da.descr, db.descr, &zero,
-                                      matC, FLAGSPARSE_R_32F, ALG, probe, &size2,
-                                      buf2.get());
-    }
-    if (st != FLAGSPARSE_STATUS_SUCCESS) {
-        const char* detail = "";
-        flagsparseGetLastErrorString(handle, &detail);
-        const char* status = (st == FLAGSPARSE_STATUS_NOT_SUPPORTED) ? "not_supported"
-                                                                     : "failed";
-        for (const char* phase : {"work_estimation", "compute", "copy"}) {
-            g_report.skip(base_row(phase), status,
-                          std::string(status_name(st)) + ": " + detail);
+std::vector<double> host_spmv(const CsrMatrix& A, const std::vector<double>& x) {
+    std::vector<double> y(static_cast<std::size_t>(A.rows), 0.0);
+    for (int64_t r = 0; r < A.rows; ++r) {
+        double acc = 0.0;
+        for (int32_t p = A.indptr[static_cast<std::size_t>(r)];
+             p < A.indptr[static_cast<std::size_t>(r) + 1]; ++p) {
+            acc += A.values[static_cast<std::size_t>(p)] *
+                   x[static_cast<std::size_t>(A.indices[static_cast<std::size_t>(p)])];
         }
-        flagsparseSpGEMM_destroyDescr(probe);
-        flagsparseDestroySpMat(matC);
-        return;
+        y[static_cast<std::size_t>(r)] = acc;
     }
-    int64_t c_rows = 0, c_cols = 0, c_nnz = 0;
-    flagsparseSpMatGetSize(matC, &c_rows, &c_cols, &c_nnz);
-    flagsparseSpGEMM_destroyDescr(probe);
-    flagsparseDestroySpMat(matC);
-
-    const auto with_nnz = [&](const char* phase) {
-        BenchRow row = base_row(phase);
-        row.num("nnz_c", static_cast<double>(c_nnz))
-           .num("buffer1_bytes", static_cast<double>(size1))
-           .num("buffer2_bytes", static_cast<double>(size2));
-        return row;
-    };
-
-    // Phase 1: work estimation, from a fresh descriptor each time.
-    g_report.measure(with_nnz("work_estimation"), [&]() {
-        flagsparseSpGEMMDescr_t d = nullptr;
-        flagsparseSpGEMM_createDescr(&d);
-        flagsparseSpMatDescr_t c = nullptr;
-        flagsparseCreateCsr(&c, m, n, 0, c_ptr_probe.get(), nullptr, nullptr,
-                            FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_32I,
-                            FLAGSPARSE_INDEX_BASE_ZERO, FLAGSPARSE_R_32F);
-        size_t s1 = 0;
-        const flagsparseStatus_t r = flagsparseSpGEMM_workEstimation(
-            handle, NT, NT, &one, da.descr, db.descr, &zero, c, FLAGSPARSE_R_32F, ALG,
-            d, &s1, buf1.get());
-        flagsparseSpGEMM_destroyDescr(d);
-        flagsparseDestroySpMat(c);
-        return r;
-    }, 0.0);
-
-    // Phase 2: the counting kernel plus the readback that discovers nnz.
-    g_report.measure(with_nnz("compute"), [&]() {
-        flagsparseSpGEMMDescr_t d = nullptr;
-        flagsparseSpGEMM_createDescr(&d);
-        flagsparseSpMatDescr_t c = nullptr;
-        flagsparseCreateCsr(&c, m, n, 0, c_ptr_probe.get(), nullptr, nullptr,
-                            FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_32I,
-                            FLAGSPARSE_INDEX_BASE_ZERO, FLAGSPARSE_R_32F);
-        size_t s1 = 0, s2 = 0;
-        flagsparseSpGEMM_workEstimation(handle, NT, NT, &one, da.descr, db.descr, &zero,
-                                        c, FLAGSPARSE_R_32F, ALG, d, &s1, buf1.get());
-        const flagsparseStatus_t r = flagsparseSpGEMM_compute(
-            handle, NT, NT, &one, da.descr, db.descr, &zero, c, FLAGSPARSE_R_32F, ALG,
-            d, &s2, buf2.get());
-        flagsparseSpGEMM_destroyDescr(d);
-        flagsparseDestroySpMat(c);
-        return r;
-    }, products);
-
-    // Phase 3: the fill kernel plus the host-side per-row sort.
-    DeviceBuffer c_ptr(static_cast<size_t>(m + 1) * sizeof(int32_t));
-    DeviceBuffer c_col(static_cast<size_t>(std::max<int64_t>(c_nnz, 1)) * sizeof(int32_t));
-    DeviceBuffer c_val(static_cast<size_t>(std::max<int64_t>(c_nnz, 1)) * sizeof(float));
-    g_report.measure(with_nnz("copy"), [&]() {
-        flagsparseSpGEMMDescr_t d = nullptr;
-        flagsparseSpGEMM_createDescr(&d);
-        flagsparseSpMatDescr_t c = nullptr;
-        flagsparseCreateCsr(&c, m, n, 0, c_ptr_probe.get(), nullptr, nullptr,
-                            FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_32I,
-                            FLAGSPARSE_INDEX_BASE_ZERO, FLAGSPARSE_R_32F);
-        size_t s1 = 0, s2 = 0;
-        flagsparseSpGEMM_workEstimation(handle, NT, NT, &one, da.descr, db.descr, &zero,
-                                        c, FLAGSPARSE_R_32F, ALG, d, &s1, buf1.get());
-        flagsparseSpGEMM_compute(handle, NT, NT, &one, da.descr, db.descr, &zero, c,
-                                 FLAGSPARSE_R_32F, ALG, d, &s2, buf2.get());
-        flagsparseCsrSetPointers(c, c_ptr.get(), c_col.get(), c_val.get());
-        const flagsparseStatus_t r = flagsparseSpGEMM_copy(
-            handle, NT, NT, &one, da.descr, db.descr, &zero, c, FLAGSPARSE_R_32F, ALG, d);
-        flagsparseSpGEMM_destroyDescr(d);
-        flagsparseDestroySpMat(c);
-        return r;
-    }, 0.0);
-}
-
-class SpGEMMBenchmark : public ::testing::Test {
-  protected:
-    Handle handle;
-    void SetUp() override {
-        if (handle.h == nullptr) GTEST_SKIP() << "no accelerator available";
-        static bool announced = false;
-        if (!announced) { print_backend_banner(); announced = true; }
-    }
-};
-
-TEST_F(SpGEMMBenchmark, SizeSweep) {
-    bench_one(handle.h, "small",  512,  512,  512,  0.02);
-    bench_one(handle.h, "medium", 2048, 2048, 2048, 0.005);
-    bench_one(handle.h, "large",  4096, 4096, 4096, 0.002);
-}
-
-// Density decides how many products land in one row's hash table, and past
-// 0.75 * 8192 a row cannot be served at all -- the sweep is where that ceiling
-// turns from a number in the source into a measured NOT_SUPPORTED row.
-TEST_F(SpGEMMBenchmark, DensitySweep) {
-    for (double d : {0.002, 0.01, 0.05, 0.2}) {
-        std::ostringstream name;
-        name << "density_" << d;
-        bench_one(handle.h, name.str().c_str(), 1024, 1024, 1024, d);
-    }
-    g_report.write();
+    return y;
 }
 
 }  // namespace
+
+TEST(SpgemmBenchmark, CsrOverCorpus) {
+    Handle handle;
+    ASSERT_NE(handle.h, nullptr);
+    report_corpus_failures(g_report, "csr");
+
+    const Scalars sc;
+    const auto declared = variants_of("spgemm");
+    for (const auto& entry : corpus()) {
+        const CsrMatrix& A = entry.A;
+        if (A.rows != A.cols) {
+            g_report.skip(BenchRow{}.tag("matrix", entry.name).tag("format", "csr"),
+                          "skipped_shape", "A*A needs a square A");
+            continue;
+        }
+        const std::vector<double> x = dense_pattern(static_cast<std::size_t>(A.cols));
+        const std::vector<double> ref = host_spmv(A, host_spmv(A, x));  // A*(A*x)
+
+        for (const registry::Variant* v : declared) {
+            if (std::string(v->format) != "csr") {
+                const std::string why =
+                    std::string("benchmark/test_spgemm.cpp has no ") + v->format +
+                    " operand builder yet";
+                report_unimplemented(g_report, *v, why.c_str());
+                continue;
+            }
+            const auto dt = v->dt;
+            BenchRow row;
+            row.name = std::string("spgemm_csr_") + v->dtype + "_" + entry.name;
+            row.tag("operator", v->op)
+               .tag("matrix", entry.name).tag("format", "csr").tag("dtype", v->dtype)
+               .tag("corpus", corpus_tag())
+               .num("rows", static_cast<double>(A.rows))
+               .num("nnz", static_cast<double>(A.nnz));
+            trace("spgemm", entry.name, v->dtype, A);
+
+            DeviceBuffer indptr = DeviceBuffer::from(A.indptr);
+            DeviceBuffer indices = DeviceBuffer::from(A.indices);
+            DeviceBuffer values = upload_as(A.values, dt);
+            DeviceBuffer c_ptr(static_cast<std::size_t>(A.rows + 1) * sizeof(int32_t));
+            if (!indptr.get() || !indices.get() || !values.get() || !c_ptr.get()) {
+                g_report.skip(std::move(row), "skipped_memory",
+                              "device allocation failed for this matrix");
+                continue;
+            }
+
+            const auto NT = FLAGSPARSE_OPERATION_NON_TRANSPOSE;
+            flagsparseSpMatDescr_t matA = nullptr, matB = nullptr, matC = nullptr;
+            flagsparseCreateCsr(&matA, A.rows, A.cols, A.nnz, indptr.get(),
+                                indices.get(), values.get(), FLAGSPARSE_INDEX_32I,
+                                FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_BASE_ZERO, dt);
+            flagsparseCreateCsr(&matB, A.rows, A.cols, A.nnz, indptr.get(),
+                                indices.get(), values.get(), FLAGSPARSE_INDEX_32I,
+                                FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_BASE_ZERO, dt);
+            flagsparseCreateCsr(&matC, A.rows, A.cols, 0, c_ptr.get(), nullptr, nullptr,
+                                FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_32I,
+                                FLAGSPARSE_INDEX_BASE_ZERO, dt);
+            flagsparseSpGEMMDescr_t descr = nullptr;
+            flagsparseSpGEMM_createDescr(&descr);
+            auto teardown = [&]() {
+                flagsparseSpGEMM_destroyDescr(descr);
+                flagsparseDestroySpMat(matA); flagsparseDestroySpMat(matB);
+                flagsparseDestroySpMat(matC);
+            };
+
+            std::size_t b1 = 0, b2 = 0;
+            flagsparseSpGEMM_workEstimation(handle.h, NT, NT, sc.alpha(dt), matA, matB,
+                                            sc.beta(dt), matC, dt,
+                                            FLAGSPARSE_SPGEMM_DEFAULT, descr, &b1,
+                                            nullptr);
+            DeviceBuffer s1(b1 ? b1 : 1);
+            flagsparseStatus_t st = flagsparseSpGEMM_workEstimation(
+                handle.h, NT, NT, sc.alpha(dt), matA, matB, sc.beta(dt), matC, dt,
+                FLAGSPARSE_SPGEMM_DEFAULT, descr, &b1, s1.get());
+            if (st == FLAGSPARSE_STATUS_SUCCESS) {
+                flagsparseSpGEMM_compute(handle.h, NT, NT, sc.alpha(dt), matA, matB,
+                                         sc.beta(dt), matC, dt,
+                                         FLAGSPARSE_SPGEMM_DEFAULT, descr, &b2, nullptr);
+            }
+            DeviceBuffer s2(b2 ? b2 : 1);
+            if (st == FLAGSPARSE_STATUS_SUCCESS) {
+                st = flagsparseSpGEMM_compute(handle.h, NT, NT, sc.alpha(dt), matA, matB,
+                                              sc.beta(dt), matC, dt,
+                                              FLAGSPARSE_SPGEMM_DEFAULT, descr, &b2,
+                                              s2.get());
+            }
+            if (st != FLAGSPARSE_STATUS_SUCCESS) {
+                teardown();
+                // The hash-table overflow path lands here. It is a capability
+                // limit of the C wrapper (the Python side falls back to a chunked
+                // ESC that the C API does not reach), so it is recorded with that
+                // reason and the sweep continues.
+                g_report.skip(std::move(row),
+                              st == FLAGSPARSE_STATUS_NOT_SUPPORTED ? "not_supported"
+                                                                    : "failed",
+                              "SpGEMM compute declined this matrix");
+                continue;
+            }
+
+            int64_t cr = 0, cc = 0, cnnz = 0;
+            flagsparseSpMatGetSize(matC, &cr, &cc, &cnnz);
+            DeviceBuffer c_ind(static_cast<std::size_t>(cnnz) * sizeof(int32_t));
+            DeviceBuffer c_val(static_cast<std::size_t>(cnnz) * elem_bytes(dt));
+            if (cnnz > 0 && (!c_ind.get() || !c_val.get())) {
+                teardown();
+                g_report.skip(std::move(row), "skipped_memory",
+                              "C allocation failed (" + std::to_string(cnnz) +
+                                  " nonzeros)");
+                continue;
+            }
+            flagsparseCsrSetPointers(matC, c_ptr.get(), c_ind.get(), c_val.get());
+            row.num("c_nnz", static_cast<double>(cnnz));
+
+            baseline::DeviceCsr bA{indptr.get(), indices.get(), values.get(),
+                                   A.rows, A.cols, A.nnz, dt};
+            g_report.measure_vs_baseline(
+                std::move(row),
+                [&]() {
+                    return flagsparseSpGEMM_copy(handle.h, NT, NT, sc.alpha(dt), matA,
+                                                 matB, sc.beta(dt), matC, dt,
+                                                 FLAGSPARSE_SPGEMM_DEFAULT, descr);
+                },
+                [&]() -> double {
+                    if (cnnz > kVerifyNnzBudget) return -1.0;  // unchecked
+                    CsrMatrix C;
+                    C.rows = cr; C.cols = cc; C.nnz = cnnz;
+                    C.indptr.resize(static_cast<std::size_t>(cr) + 1);
+                    C.indices.resize(static_cast<std::size_t>(cnnz));
+                    if (to_host(C.indptr.data(), c_ptr.get(),
+                                C.indptr.size() * sizeof(int32_t)) !=
+                        FLAGSPARSE_STATUS_SUCCESS) return 1e30;
+                    if (cnnz > 0 &&
+                        to_host(C.indices.data(), c_ind.get(),
+                                C.indices.size() * sizeof(int32_t)) !=
+                            FLAGSPARSE_STATUS_SUCCESS) return 1e30;
+                    C.values = read_back(c_val.get(), static_cast<std::size_t>(cnnz), dt);
+                    if (cnnz > 0 && C.values.empty()) return 1e30;
+                    return max_error_ratio(host_spmv(C, x), ref, default_tolerance(dt));
+                },
+                [&](baseline::Timing* t) {
+                    return baseline::spgemm_csr(bA, sc.alpha(dt), sc.beta(dt),
+                                                BenchReport::kWarmup,
+                                                BenchReport::kIters, t);
+                },
+                0.0);
+            teardown();
+        }
+    }
+    EXPECT_GT(g_report.size(), 0u);
+}
+
+int main(int argc, char** argv) {
+    ::testing::InitGoogleTest(&argc, argv);
+    const int rc = RUN_ALL_TESTS();
+    g_report.write();
+    return rc;
+}

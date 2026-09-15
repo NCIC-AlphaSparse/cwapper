@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "flagsparse.h"
+#include "baseline/baseline.hpp"
 
 namespace fstest {
 
@@ -108,6 +109,20 @@ struct TriMatrix {
 TriMatrix random_triangular(int64_t n, double density, bool lower, bool unit_diag,
                             uint32_t seed);
 
+// A lower-triangular matrix in sliced-ELL. The format's rules are structural,
+// not advisory, so they are built in rather than hoped for: every row carries
+// exactly one diagonal entry, padding is -1 and strictly trailing, and a slice
+// is as wide as its longest row.
+struct SellMatrix {
+    int64_t n = 0, slice_size = 0;
+    std::vector<int32_t> offsets, cols;
+    std::vector<double> values;
+    std::vector<double> dense;          // n x n row-major, the reference
+};
+
+SellMatrix random_sell_lower(int64_t n, int64_t slice_size, double density,
+                             uint32_t seed);
+
 // One row index per nonzero: the COO expansion of a CSR pattern. Row-sorted by
 // construction, which is what both cuSPARSE and this library require of a COO.
 std::vector<int32_t> coo_row_indices_of(const CsrMatrix& A);
@@ -135,6 +150,12 @@ double max_error_ratio(const std::vector<double>& actual, const std::vector<doub
                        Tolerance tol);
 
 const char* status_name(flagsparseStatus_t st);
+
+// Bytes per value / per index. The library has these internally, but the public
+// surface is flagsparse.h and nothing else, so the tests carry their own -- and
+// a memory-bound operator cannot report bytes moved without them.
+std::size_t value_bytes(flagsparseDataType_t dtype);
+std::size_t index_bytes(flagsparseIndexType_t idx);
 
 // Print which backend and device the run landed on, once per binary.
 //
@@ -177,6 +198,24 @@ struct BenchRow {
     double median_ms = 0.0;
     double gflops = 0.0;
 
+    // ---- the vendor comparison. Filled by measure_vs_baseline, blank otherwise.
+    //
+    // `speedup` is baseline_ms / median_ms and is written ONLY when accuracy is
+    // "pass". A speedup computed from a wrong answer is not a speedup, and the
+    // rule the aggregate applies has to be visible on the row that fed it.
+    double baseline_ms = 0.0;
+    double speedup = 0.0;
+
+    // "pass" | "fail" | "unchecked". Judged against the CPU fp64 oracle, never
+    // against the baseline -- see baseline/baseline.hpp.
+    std::string accuracy = "unchecked";
+    double error_ratio = 0.0;
+
+    // "ok" | "unavailable" | "failed". When not ok, baseline_detail says why and
+    // the speedup column stays blank.
+    std::string baseline_status = "unavailable";
+    std::string baseline_detail;
+
     BenchRow& num(const std::string& key, double value) {
         numbers.emplace_back(key, value);
         return *this;
@@ -201,9 +240,39 @@ class BenchReport {
     bool measure(BenchRow row, const std::function<flagsparseStatus_t()>& once,
                  double flops);
 
+    // One matrix of a corpus sweep: time ours, check the answer, time the vendor,
+    // and record all three on one row.
+    //
+    // NOTHING HERE ABORTS THE SWEEP. Every way this can go wrong -- the operator
+    // declines, the operator errors, the answer is out of tolerance, the baseline
+    // is unavailable, the baseline errors -- produces a row carrying the reason
+    // and returns false, so the caller moves to the next matrix. A benchmark that
+    // stops at the first bad matrix reports the corpus it got through, not the
+    // corpus it was given.
+    //
+    //   once   : runs the operator (timed, and leaves its result in place)
+    //   verify : error ratio of that result against the CPU fp64 oracle;
+    //            <= 1 passes, per spec 6.3. Return a negative value to declare
+    //            the check not applicable, which records accuracy="unchecked"
+    //            and withholds the speedup.
+    //   base   : runs the vendor baseline; may report unavailable, which is a
+    //            recorded fact and not a failure.
+    bool measure_vs_baseline(
+        BenchRow row, const std::function<flagsparseStatus_t()>& once,
+        const std::function<double()>& verify,
+        const std::function<baseline::Status(baseline::Timing*)>& base, double flops);
+
     // Record a case that was never measured -- no descriptor, unsupported shape.
     void skip(BenchRow row, const std::string& status, const std::string& detail);
 
+    // Writes BOTH artifacts from the one sweep:
+    //   $FLAGSPARSE_BENCH_OUT/<op>_benchmark.json   timings and speedups
+    //   $FLAGSPARSE_BENCH_OUT/<op>_accuracy.json    per-variant error ratios
+    //
+    // They are two files because two consumers want two things, not because
+    // there were two runs. Every row here was checked against the host fp64
+    // oracle BEFORE it was timed, so the accuracy artifact is not derived from
+    // the timing one -- both are views of the same measurement, and each says so.
     void write() const;
     std::size_t size() const { return rows_.size(); }
 

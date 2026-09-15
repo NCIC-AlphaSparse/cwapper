@@ -19,12 +19,12 @@ Python 侧的 Triton 内核。
 | C++ 调度层（句柄 / 描述符 / 状态映射 / JIT 桥 / 后端 adaptor） | **完整** |
 | 构建（CMake、BACKEND 开关、install、Docker） | **完整** |
 | 测试框架（gtest + ctest，精度 + 性能，JSON 落盘） | **完整** |
-| **算子** | **17 / 22 组打通**：SpMV 全 5 组（`csr`/`coo`/`csc`/`bsr`/`coo_tocsr`）、SpMM 2 组（`csr`/`coo`）、SpSV 3 组、SpSM 2 组、`spgemm_csr`、`sddmm_csr`、`gather`/`scatter`、稀疏格式构造。其余 5 组返回 `NOT_SUPPORTED` |
+| **算子** | **18 / 22 组打通**：SpMV 全 5 组（`csr`/`coo`/`csc`/`bsr`/`coo_tocsr`）、SpMM 2 组（`csr`/`coo`）、SpSV **全 4 组**（`csr`/`coo`/`sell`/描述符全流程）、SpSM 2 组、`spgemm_csr`、`sddmm_csr`、`gather`/`scatter`、稀疏格式构造。其余 4 组是 SpMM 的性能变体，返回 `NOT_SUPPORTED` |
 
 逐算子状态以 `conf/operators.yaml` 为准（`status: implemented` / `pending`）。
 
 **分母有两个，别混用**：规范 §5.1 的对齐表是 **22 个算子组**，而合并 i32/i64 之后
-是 **115 个变体**。上表的 17/22 是**组**。变体级的明细在
+是 **115 个变体**。上表的 18/22 是**组**。变体级的明细在
 `算子对比结果_合并变体.csv` 里，该文件不在本仓库，所以 `operators.yaml` 的
 `variants` 字段留空而不是猜——115 也不能从这里的 dtype/format 列表反推，
 那些描述的是 Python 侧支持什么，和 CSV 的切分方式不是一回事。
@@ -42,7 +42,8 @@ ctest 全量 6/6 passed
   accuracy.spmv    14/14  CSR / COO / CSC / BSR 四种格式，含 CSC 的三个方向、
                           BSR 的 block_dim 1/2/4/8 与多段网格、COO 两条路线互相印证
   accuracy.sddmm    7/7   k 跨 BLOCK_K 阈值、两种 BLOCK_P 配置、行列主序 × op(A)/op(B)
-  accuracy.spsv     8/8   上/下三角 × 单位/非单位对角 × CSR/COO × 实数/复数
+  accuracy.spsv   11/11  上/下三角 × 单位/非单位对角 × CSR/COO/SELL × 实数/复数；
+                          SELL 两条算法路线误差比逐位相同，slice 4/8/32 与不等长行都覆盖
   accuracy.spsm     6/6   含 1500 个右端项（跨多个 RHS tile）与全部布局组合
   accuracy.spgemm   5/5   发现的 nnz 与稠密参考逐个匹配，列有序，fp64 误差为 0
   accuracy.spmm    17/17  CSR + COO 全部严格容差通过：fp32 0.10~0.47、fp64 0~0.018、
@@ -205,7 +206,7 @@ warp/factor 启发式（4~32）。所以这条数据要读成"**CSR 的 launch �
 
 ---
 
-## 为什么剩下 5 组不是照抄就能完事
+## 为什么剩下 4 组不是照抄就能完事
 
 Python 包里 `sparse_operations/` 共 39,594 行，其中 `@triton.jit` 内核体
 7,139 行（18%），**其余 32,455 行（82%）是编排、校验、路由、回退和基准**。
@@ -237,6 +238,9 @@ cmake --build build -j
 ```
 
 ### 平台矩阵
+
+> 每个后端的环境检查、构建和测试方法在 **[docs/](docs/)**，一个平台一份。
+
 
 测试脚本（精度 + 性能）覆盖 CUDA 加国产加速器。每一格的状态是**配置跑出来的**，不是声称的：
 
@@ -431,8 +435,7 @@ deps/libtriton_jit/         子模块
 conf/operators.yaml         算子注册表
 conf/test_matrix.yaml       测试参数空间与容差
 ctest/accuracy/             精度测试
-ctest/benchmark/            性能测试
+ctest/benchmark/            性能测试（合成形状）
+tools/matrix_sweep.cpp      真实矩阵语料扫描：全部算子变体 × 全部矩阵
 docker/Dockerfile           构建环境
 ```
-#   c w a p p e r  
- 

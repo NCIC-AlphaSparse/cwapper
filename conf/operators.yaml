@@ -34,7 +34,8 @@ backend_default: cuda
 # case on MUSA, where torch.sparse has no working matmul at all.
 accuracy_reference: host_fp64
 performance_baseline:
-  cuda: cusparse      # not wired up yet; benchmark reports speedup: null
+  cuda: cusparse      # wired: ctest/baseline/cuda, verified against cuSPARSE 12.5
+  rocm: hipsparse     # wired: ctest/baseline/rocm, not yet compiled on a DCU box
   default: none
 
 operators:
@@ -49,7 +50,7 @@ operators:
     kernel_module: flagsparse_codegen/gather_scatter.py
     kernel_name: [gather_real_kernel, gather_complex_kernel]
     dispatch: src/ops/gather_scatter.cpp
-    tests: [ctest/accuracy/test_gather.cpp]
+    tests: [ctest/accuracy/test_gather.cpp, ctest/benchmark/test_gather.cpp]
     status: implemented
     notes: >
       Python side is complete. On MUSA the reference used by the Python test
@@ -67,7 +68,7 @@ operators:
     kernel_module: flagsparse_codegen/gather_scatter.py
     kernel_name: [scatter_real_kernel, scatter_complex_kernel]
     dispatch: src/ops/gather_scatter.cpp
-    tests: [ctest/accuracy/test_scatter.cpp]
+    tests: [ctest/accuracy/test_scatter.cpp, ctest/benchmark/test_scatter.cpp]
     status: implemented
 
   - id: spmv_csr
@@ -76,7 +77,7 @@ operators:
     c_api: [flagsparseSpMV, flagsparseSpMV_bufferSize, flagsparseSpMV_preprocess]
     python_impl: [flagsparse_spmv_csr, prepare_spmv_csr]
     formats: [csr]
-    dtypes: [f32, f64]          # complex pending: needs the real/imag split in C++
+    dtypes: [f32, f64, c64, c128]   # complex wired 2026-09; measured accurate vs host fp64
     index_types: [int]
     ops: [non]                  # trans/conj pending
     algorithms: [FLAGSPARSE_SPMV_ALG_DEFAULT, FLAGSPARSE_SPMV_CSR_ALG1, FLAGSPARSE_SPMV_CSR_ALG2]
@@ -100,7 +101,7 @@ operators:
     kernel_module: flagsparse_codegen/spmv_coo.py
     kernel_name: [_spmv_coo_seg_f32, _spmv_coo_seg_f64, spmv_coo_seg_complex]
     dispatch: src/ops/spmv.cpp
-    tests: [ctest/accuracy/test_spmv.cpp]
+    tests: [ctest/accuracy/test_spmv.cpp, ctest/benchmark/test_spmv.cpp]
     status: implemented
     notes: >
       The deterministic segment route, run with SEG_IS_ROW=True so seg_starts is
@@ -122,7 +123,7 @@ operators:
     kernel_name: [_spmv_csc_non_real_kernel, _spmv_csc_non_complex_kernel,
                   _spmv_csc_trans_real_kernel, _spmv_csc_trans_complex_kernel]
     dispatch: src/ops/spmv.cpp
-    tests: [ctest/accuracy/test_spmv.cpp]
+    tests: [ctest/accuracy/test_spmv.cpp, ctest/benchmark/test_spmv.cpp]
     status: implemented
     notes: >
       The only format here with all three directions. trans/conj_trans are
@@ -145,7 +146,7 @@ operators:
     kernel_name: [_spmv_bsr_non_real_kernel, _spmv_bsr_non_complex_kernel,
                   _spmv_bsr_trans_real_kernel, _spmv_bsr_trans_complex_kernel]
     dispatch: src/ops/spmv.cpp
-    tests: [ctest/accuracy/test_spmv.cpp]
+    tests: [ctest/accuracy/test_spmv.cpp, ctest/benchmark/test_spmv.cpp]
     status: implemented
     notes: >
       Square blocks only: the kernel uses one BLOCK_DIM for both block extents,
@@ -166,7 +167,7 @@ operators:
     kernel_module: flagsparse_codegen/spmv_csr.py
     kernel_name: _spmv_csr_real_kernel
     dispatch: src/ops/spmv.cpp
-    tests: [ctest/accuracy/test_spmv.cpp]
+    tests: [ctest/accuracy/test_spmv.cpp, ctest/benchmark/test_spmv.cpp]
     status: implemented
     notes: >
       Selected by FLAGSPARSE_SPMV_COO_ALG2. Nothing is converted or copied: a
@@ -274,7 +275,7 @@ operators:
     kernel_name: [_spgemm_hash_count_kernel, _spgemm_hash_fill_kernel,
                   _spgemm_hash_fill_kernel_f64]
     dispatch: src/ops/spgemm.cpp
-    tests: [ctest/accuracy/test_spgemm.cpp]
+    tests: [ctest/accuracy/test_spgemm.cpp, ctest/benchmark/test_spgemm.cpp]
     status: implemented
     notes: >
       The only operator whose result SIZE is discovered rather than given, so it
@@ -304,7 +305,7 @@ operators:
     kernel_module: flagsparse_codegen/sddmm_csr.py
     kernel_name: [sddmm_csr_real, _row_ids_kernel]
     dispatch: src/ops/sddmm.cpp
-    tests: [ctest/accuracy/test_sddmm.cpp]
+    tests: [ctest/accuracy/test_sddmm.cpp, ctest/benchmark/test_sddmm.cpp]
     status: implemented
     notes: >
       The one operator whose kernel already spoke cuSPARSE -- alpha, beta and
@@ -324,13 +325,13 @@ operators:
     formats: [csr]
     dtypes: [f32, f64, c64, c128]
     index_types: [int]
-    ops: [non]                  # trans is a different traversal kernel; pending
+    ops: [non]                  # see spsv_transpose_gap in the notes below
     fill_modes: [lower, upper]
     diag_types: [unit, non_unit]
     kernel_module: flagsparse_codegen/spsv.py
     kernel_name: [_spsv_csr_cw_kernel, _spsv_csr_cw_kernel_complex]
     dispatch: src/ops/spsv.cpp
-    tests: [ctest/accuracy/test_spsv.cpp]
+    tests: [ctest/accuracy/test_spsv.cpp, ctest/benchmark/test_spsv.cpp]
     status: implemented
     notes: >
       The chain-wave route: workers take rows from an atomic counter and spin on
@@ -341,6 +342,15 @@ operators:
       needs it last, which with cuSPARSE's universal ascending column order means
       scanning an upper row from its far end. Without it, upper + non-unit
       silently skipped every off-diagonal term.
+
+      spsv_transpose_gap: opA=TRANSPOSE is refused for every format, and that is
+      an UNWIRED CAPABILITY rather than a missing one. The operator package has
+      _spsv_csr_transpose_cw_kernel(_complex), _spsv_csr_roc_kernel(_complex) and
+      the SELL trans queue kernels, all at module level and re-exportable; SELL
+      additionally does conjugate transpose. Solving L^T y = x over lower storage
+      is how an upper-triangular SYSTEM is expressed there, which is distinct from
+      a matrix STORED upper (FILL_MODE_UPPER), and that one is already wired for
+      CSR and COO.
 
   - id: spsv_coo
     zhiyuan_name: SpSV_COO
@@ -355,7 +365,7 @@ operators:
     kernel_module: flagsparse_codegen/spsv.py
     kernel_name: [_spsv_csr_cw_kernel, _spsv_csr_cw_kernel_complex]
     dispatch: src/ops/spsv.cpp
-    tests: [ctest/accuracy/test_spsv.cpp]
+    tests: [ctest/accuracy/test_spsv.cpp, ctest/benchmark/test_spsv.cpp]
     status: implemented
     notes: >
       No second kernel and no converted copy: _analysis builds the row-offsets
@@ -365,16 +375,46 @@ operators:
 
   - id: spsv_sell
     zhiyuan_name: SpSV_SELL
-    cusparse_api: cusparseSpSV_solve
-    c_api: [flagsparseSpSV_solve]
-    python_impl: [flagsparse_spsv_analysis_sell]
+    cusparse_api: null          # sliced-ELL is a FlagSparse extension
+    c_api: [flagsparseCreateSlicedEll, flagsparseSpSV_bufferSize,
+            flagsparseSpSV_analysis, flagsparseSpSV_solve]
+    python_impl: [flagsparse_spsv_sell, flagsparse_spsv_analysis_sell]
     formats: [sell]
-    algorithms: [FLAGSPARSE_SPSV_SELL_ALG1, FLAGSPARSE_SPSV_SELL_ALG2]
-    status: pending
+    dtypes: [f32, f64, c64, c128]
+    index_types: [int32]        # SELL column indices are i32; -1 marks padding
+    ops: [non]
+    fill_modes: [lower]         # the kernels have no fill-mode switch
+    diag_types: [unit, non_unit]
+    algorithms: [FLAGSPARSE_SPSV_ALG_DEFAULT, FLAGSPARSE_SPSV_SELL_ALG1,
+                 FLAGSPARSE_SPSV_SELL_ALG2]
+    kernel_module: flagsparse_codegen/spsv.py
+    kernel_name: [_spsv_sell_cw_kernel_alg1, _spsv_sell_cw_kernel_alg1_complex,
+                  _spsv_sell_slice_kernel_alg2, _spsv_sell_slice_kernel_alg2_complex]
+    dispatch: src/ops/spsv.cpp
+    tests: [ctest/accuracy/test_spsv.cpp, ctest/benchmark/test_spsv.cpp]
+    status: implemented
     notes: >
-      Sliced-ELL is a FlagSparse extension with no cuSPARSE counterpart, and it
-      has its own kernels (slice/queue based) plus a structure-analysis pass.
-      Not reachable through the C API yet.
+      No cuSPARSE counterpart, so FLAGSPARSE_SPSV_SELL_ALG1/_ALG2 are FlagSparse's
+      own ids and had to be added to the public enum. ALG1 is one program per row
+      (the CSR chain-wave shape); ALG2 is one per slice with a lane per row, which
+      keeps column loads coalesced and lets an independent row continue instead of
+      waiting for the most serialised row in its slice. DEFAULT picks ALG1, and
+      that is measured, not assumed: on a uniform-row matrix ALG1 wins at every
+      slice size (0.089 vs 0.174 ms at slice 4, 8192 rows). ALG2's advantage
+      needs rows of very different lengths inside one slice, which that matrix
+      does not have -- so "ALG2 is slower" is not the conclusion to draw from it.
+      LOWER STORAGE ONLY, and the distinction matters: all four kernels test
+      dependencies with a bare col < row and carry no fill-mode constexpr, so a
+      matrix STORED upper is refused rather than solved as if its entries were
+      below the diagonal. The operator package has no fill mode for SELL either
+      -- flagsparse_spsv_sell takes no `lower` argument at all. An upper-triangular
+      SYSTEM is a different thing and IS reachable in the package, by solving
+      L^T y = x over lower storage (transpose=True, and "C" for conjugate); in
+      cuSPARSE terms that is FILL_MODE_LOWER with opA=TRANSPOSE, which this API
+      does not wire yet for any format. No DIAG_EPS either, unlike the CSR route
+      -- the format already requires exactly one diagonal per row.
+      Needs no scratch beyond the ready flags and the row counter: the slice
+      offsets already describe the structure, so there is nothing to build.
 
   - id: spsv_descriptor_api
     zhiyuan_name: SpSV descriptor lifecycle
@@ -412,7 +452,7 @@ operators:
     kernel_name: [_spsm_csr_polling_kernel_real, _spsm_csr_polling_kernel_complex,
                   _spsm_extract_diag_kernel_real, _spsm_extract_diag_kernel_complex]
     dispatch: src/ops/spsm.cpp
-    tests: [ctest/accuracy/test_spsm.cpp]
+    tests: [ctest/accuracy/test_spsm.cpp, ctest/benchmark/test_spsm.cpp]
     status: implemented
     notes: >
       Polling route: one program per (row, RHS tile), spinning on a per-(tile,
@@ -437,7 +477,7 @@ operators:
     kernel_module: flagsparse_codegen/spsm.py
     kernel_name: [_spsm_csr_polling_kernel_real, _spsm_csr_polling_kernel_complex]
     dispatch: src/ops/spsm.cpp
-    tests: [ctest/accuracy/test_spsm.cpp]
+    tests: [ctest/accuracy/test_spsm.cpp, ctest/benchmark/test_spsm.cpp]
     status: implemented
     notes: >
       Same treatment as SpSV COO: _analysis builds a row-offsets array after the

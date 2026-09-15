@@ -44,6 +44,10 @@ namespace {
 // Where the worker-count sweep saturates on the reference card; past this the
 // solve stops getting faster and only costs launch width.
 constexpr int64_t kMaxWorkers = 2048;
+
+bool is_sell_alg(flagsparseSpSVAlg_t alg) {
+    return alg == FLAGSPARSE_SPSV_SELL_ALG1 || alg == FLAGSPARSE_SPSV_SELL_ALG2;
+}
 constexpr int kNumWarps = 1;
 constexpr int kNumStages = 1;
 
@@ -52,6 +56,9 @@ struct SpSVDescr {
     void* buffer = nullptr;                // scratch handed to _analysis
     const void* analysed_matrix = nullptr; // which matrix it was analysed for
     flagsparseOperation_t analysed_op = FLAGSPARSE_OPERATION_NON_TRANSPOSE;
+    // SpSV_solve takes the alg again, but the SELL routes differ in how the
+    // scratch is USED, so the one analysis ran with is what the solve must use.
+    flagsparseSpSVAlg_t analysed_alg = FLAGSPARSE_SPSV_ALG_DEFAULT;
     bool analysed = false;
 };
 
@@ -81,6 +88,9 @@ flagsparseStatus_t read_scalar(flagsparseHandle_t handle, const void* p,
 
 // [ ready flags : n_rows int32 | row counter : 1 int32 ] and, for COO, the
 // row-offsets array that makes it addressable as CSR: another n_rows + 1 int32.
+// [ ready flags : n_rows int32 | row counter : 1 int32 ] for every format, plus
+// for COO the row-offsets array that makes it addressable as CSR. Sliced-ELL
+// needs no extra: its slice offsets already describe the structure.
 size_t scratch_bytes(const SpMatDescr* A) {
     const size_t base = static_cast<size_t>(A->rows + 1) * sizeof(std::int32_t);
     return (A->format == FLAGSPARSE_FORMAT_COO) ? base * 2 : base;
@@ -108,7 +118,17 @@ flagsparseStatus_t validate(flagsparseHandle_t handle, flagsparseOperation_t opA
     if (matA == nullptr || vecX == nullptr || vecY == nullptr || spsvDescr == nullptr) {
         return FLAGSPARSE_STATUS_INVALID_VALUE;
     }
-    if (alg != FLAGSPARSE_SPSV_ALG_DEFAULT) return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+    // The SELL algorithm ids name a FORMAT, not a tuning knob: asking for one
+    // on a CSR/COO matrix, or omitting one on a SELL matrix, is a caller mistake
+    // rather than a hint to ignore.
+    const bool sell = (spmat(matA)->format == FLAGSPARSE_FORMAT_SLICED_ELL);
+    if (sell) {
+        if (alg != FLAGSPARSE_SPSV_ALG_DEFAULT && !is_sell_alg(alg)) {
+            return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+        }
+    } else if (alg != FLAGSPARSE_SPSV_ALG_DEFAULT) {
+        return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+    }
 
     const SpMatDescr* A = spmat(matA);
     const DnVecDescr* X = dnvec(vecX);
@@ -117,7 +137,8 @@ flagsparseStatus_t validate(flagsparseHandle_t handle, flagsparseOperation_t opA
         Y->value_type != computeType) {
         return FLAGSPARSE_STATUS_NOT_SUPPORTED;
     }
-    if (A->format != FLAGSPARSE_FORMAT_CSR && A->format != FLAGSPARSE_FORMAT_COO) {
+    if (A->format != FLAGSPARSE_FORMAT_CSR && A->format != FLAGSPARSE_FORMAT_COO &&
+        A->format != FLAGSPARSE_FORMAT_SLICED_ELL) {
         return FLAGSPARSE_STATUS_NOT_SUPPORTED;
     }
     if (A->format == FLAGSPARSE_FORMAT_COO &&
@@ -149,6 +170,24 @@ flagsparseStatus_t validate(flagsparseHandle_t handle, flagsparseOperation_t opA
             "(flagsparseSpMatSetAttribute) -- there is no safe default.";
         return FLAGSPARSE_STATUS_INVALID_VALUE;
     }
+    if (A->format == FLAGSPARSE_FORMAT_SLICED_ELL) {
+        if (A->slice_size <= 0) return FLAGSPARSE_STATUS_INVALID_VALUE;
+        // All four SELL kernels test dependencies with a bare `col < row` and
+        // carry no fill-mode constexpr, so an upper triangle would be solved as
+        // though its entries were below the diagonal. Refusing beats returning
+        // a plausible wrong answer.
+        if (A->fill_mode != FLAGSPARSE_FILL_MODE_LOWER) {
+            ctx(handle)->last_error =
+                "SpSV on a sliced-ELL matrix supports FILL_MODE_LOWER only: the "
+                "kernels have no fill-mode switch.";
+            return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+        }
+        // The column indices are i32 in every SELL kernel (padding is -1).
+        if (A->indices_type != FLAGSPARSE_INDEX_32I ||
+            A->offsets_type != FLAGSPARSE_INDEX_32I) {
+            return FLAGSPARSE_STATUS_NOT_SUPPORTED;
+        }
+    }
     return FLAGSPARSE_STATUS_SUCCESS;
 }
 
@@ -161,6 +200,85 @@ int64_t resolve_worker_count(int64_t n_rows, int device_index) {
     const int64_t device_max =
         std::max<int64_t>(1, adaptor::multiprocessor_count(device_index) * per_mp);
     return std::max<int64_t>(1, std::min({n_rows, device_max, kMaxWorkers}));
+}
+
+// Sliced-ELL. Same scratch and the same no-deadlock argument as the CSR route
+// -- workers take rows (ALG1) or slices (ALG2) from one ascending counter and
+// only ever wait on lower indices -- so the only differences are the traversal
+// and two extra constexprs.
+flagsparseStatus_t solve_sell(flagsparseHandle_t handle, const SpMatDescr* A,
+                              const DnVecDescr* X, DnVecDescr* Y,
+                              flagsparseDataType_t computeType,
+                              flagsparseSpSVAlg_t alg, std::int32_t* flags,
+                              double alpha_re, double alpha_im) {
+    const int64_t n = A->rows;
+    const int64_t slice_size = A->slice_size;
+    const int64_t n_slices = (n + slice_size - 1) / slice_size;
+    // ALG2 gives one lane per row of a slice, and tl.arange needs a power of two.
+    int64_t block_rows = 1;
+    while (block_rows < slice_size) block_rows <<= 1;
+
+    const bool complex_op = is_complex(computeType);
+    const flagsparseDataType_t component = component_dtype(computeType);
+    const bool acc_fp64 = (component == FLAGSPARSE_R_64F);
+    const bool unit_diag = (A->diag_type == FLAGSPARSE_DIAG_TYPE_UNIT);
+    // DEFAULT picks ALG1: it is the simpler traversal and the one that does not
+    // depend on the slice being wide enough to keep its lanes busy.
+    const bool use_alg2 = (alg == FLAGSPARSE_SPSV_SELL_ALG2);
+
+    const char* vt = triton_dtype(component);
+    std::string sig;
+    sig.reserve(192);
+    sig += "*"; sig += vt; sig += ":16,";   // values
+    sig += "*i32:16,";                      // col_indices (padding is -1)
+    sig += "*i32:16,";                      // slice_offsets
+    sig += "*"; sig += vt; sig += ":16,";   // b
+    sig += "*"; sig += vt; sig += ":16,";   // x
+    sig += "*i32:16,";                      // ready
+    sig += "*i32:16,";                      // row_counter
+    sig += vt; sig += ",";                  // alpha (re)
+    if (complex_op) { sig += vt; sig += ","; }
+    sig += "i32,";                          // n_rows
+    if (use_alg2) sig += "i32,";            // n_slices
+    sig += std::to_string(slice_size) + ",";
+    if (use_alg2) sig += std::to_string(block_rows) + ",";
+    sig += unit_diag ? "True," : "False,";
+    sig += acc_fp64 ? "True" : "False";
+
+    std::vector<jit::Arg> args;
+    args.reserve(12);
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->values)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->indices)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(A->offsets)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(X->values)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(Y->values)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(flags)));
+    args.push_back(jit::Arg::ptr(reinterpret_cast<adaptor::DevicePtr>(flags + n)));
+    if (acc_fp64) {
+        args.push_back(jit::Arg::d(alpha_re));
+        if (complex_op) args.push_back(jit::Arg::d(alpha_im));
+    } else {
+        args.push_back(jit::Arg::f(static_cast<float>(alpha_re)));
+        if (complex_op) args.push_back(jit::Arg::f(static_cast<float>(alpha_im)));
+    }
+    args.push_back(jit::Arg::i(static_cast<std::int32_t>(n)));
+    if (use_alg2) args.push_back(jit::Arg::i(static_cast<std::int32_t>(n_slices)));
+
+    const char* kernel;
+    if (use_alg2) kernel = complex_op ? "_spsv_sell_slice_kernel_alg2_complex"
+                                      : "_spsv_sell_slice_kernel_alg2";
+    else          kernel = complex_op ? "_spsv_sell_cw_kernel_alg1_complex"
+                                      : "_spsv_sell_cw_kernel_alg1";
+
+    // ALG2's unit of work is a slice, so it needs proportionally fewer workers.
+    const int64_t units = use_alg2 ? n_slices : n;
+    const int64_t workers = resolve_worker_count(units, ctx(handle)->device_index);
+    std::string err;
+    const flagsparseStatus_t st = jit::launch(
+        jit::codegen_module("spsv.py"), kernel, sig, ctx(handle)->stream,
+        workers, 1, 1, kNumWarps, kNumStages, args, &err);
+    if (st != FLAGSPARSE_STATUS_SUCCESS) ctx(handle)->last_error = err;
+    return st;
 }
 
 flagsparseStatus_t solve(flagsparseHandle_t handle, const void* alpha,
@@ -192,9 +310,21 @@ flagsparseStatus_t solve(flagsparseHandle_t handle, const void* alpha,
     const int64_t n = A0->rows;
     if (n == 0) return FLAGSPARSE_STATUS_SUCCESS;
 
+    auto* flags32 = reinterpret_cast<std::int32_t*>(d->buffer);
+    if (A0->format == FLAGSPARSE_FORMAT_SLICED_ELL) {
+        // The ready flags and the row counter must start at zero; the kernels
+        // only ever set flags, they never clear them.
+        if (flagsparseStatus_t s = adaptor::memset_device(
+                reinterpret_cast<adaptor::DevicePtr>(d->buffer), 0,
+                static_cast<size_t>(n + 1) * sizeof(std::int32_t))) {
+            return s;
+        }
+        return solve_sell(handle, A0, X, Y, computeType, d->analysed_alg, flags32,
+                          alpha_re, alpha_im);
+    }
+
     // COO runs through the CSR kernel over the offsets built by _analysis, which
     // live in the second half of the scratch.
-    auto* flags32 = reinterpret_cast<std::int32_t*>(d->buffer);
     const SpMatDescr view =
         (A0->format == FLAGSPARSE_FORMAT_COO)
             ? csr_view_of_coo(A0, flags32 + (n + 1))
@@ -330,6 +460,19 @@ flagsparseStatus_t flagsparseSpSV_analysis(
         auto* A = const_cast<SpMatDescr*>(spmat(matA));
         if (A->rows > 0 && externalBuffer == nullptr) return FLAGSPARSE_STATUS_INVALID_VALUE;
 
+        // Sliced-ELL carries its own structure: slice offsets plus padding, and
+        // the format already requires exactly one diagonal per row with padding
+        // trailing. There is no CSR view to build and no column order to check.
+        if (A->format == FLAGSPARSE_FORMAT_SLICED_ELL) {
+            auto* sell = spsv(spsvDescr);
+            sell->buffer = externalBuffer;
+            sell->analysed_matrix = static_cast<const void*>(A);
+            sell->analysed_op = opA;
+            sell->analysed_alg = alg;
+            sell->analysed = true;
+            return FLAGSPARSE_STATUS_SUCCESS;
+        }
+
         // A COO matrix gets its row-offsets array built here, into the second
         // half of the scratch; that is also where an unsorted COO is rejected.
         SpMatDescr checked = *A;
@@ -349,6 +492,7 @@ flagsparseStatus_t flagsparseSpSV_analysis(
         d->buffer = externalBuffer;
         d->analysed_matrix = static_cast<const void*>(A);
         d->analysed_op = opA;
+        d->analysed_alg = alg;
         d->analysed = true;
         return FLAGSPARSE_STATUS_SUCCESS;
     });

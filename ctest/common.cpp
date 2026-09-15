@@ -15,7 +15,10 @@
 
 #include "common.hpp"
 
+#include "corpus.hpp"
+
 #include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <ctime>
 #include <cstdlib>
@@ -68,6 +71,60 @@ CsrMatrix random_csr(int64_t rows, int64_t cols, double density, uint32_t seed) 
     }
     A.nnz = static_cast<int64_t>(A.indices.size());
     return A;
+}
+
+SellMatrix random_sell_lower(int64_t n, int64_t slice_size, double density,
+                             uint32_t seed) {
+    SellMatrix S;
+    S.n = n; S.slice_size = slice_size;
+    S.dense.assign(static_cast<std::size_t>(n * n), 0.0);
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<double> unit(0.0, 1.0);
+    std::normal_distribution<double> value(0.0, 1.0);
+    const double expected = std::max(1.0, density * static_cast<double>(n));
+
+    // Row contents first, so the slice width can be the max over its rows.
+    std::vector<std::vector<std::pair<int32_t, double>>> rows(
+        static_cast<std::size_t>(n));
+    for (int64_t r = 0; r < n; ++r) {
+        for (int64_t c = 0; c < r; ++c) {
+            if (unit(rng) >= density) continue;
+            const double v = value(rng) / (4.0 * expected);
+            rows[static_cast<std::size_t>(r)].emplace_back(static_cast<int32_t>(c), v);
+            S.dense[static_cast<std::size_t>(r * n + c)] = v;
+        }
+        const double d = 2.0 + std::abs(value(rng));
+        rows[static_cast<std::size_t>(r)].emplace_back(static_cast<int32_t>(r), d);
+        S.dense[static_cast<std::size_t>(r * n + r)] = d;
+    }
+
+    const int64_t n_slices = (n + slice_size - 1) / slice_size;
+    S.offsets.assign(static_cast<std::size_t>(n_slices) + 1, 0);
+    for (int64_t s = 0; s < n_slices; ++s) {
+        std::size_t width = 0;
+        for (int64_t lane = 0; lane < slice_size; ++lane) {
+            const int64_t r = s * slice_size + lane;
+            if (r < n) width = std::max(width, rows[static_cast<std::size_t>(r)].size());
+        }
+        // Column-major within a slice: slot-major, lane-minor, which is what
+        // makes one slot of every row a coalesced load.
+        for (std::size_t slot = 0; slot < width; ++slot) {
+            for (int64_t lane = 0; lane < slice_size; ++lane) {
+                const int64_t r = s * slice_size + lane;
+                const bool present =
+                    r < n && slot < rows[static_cast<std::size_t>(r)].size();
+                S.cols.push_back(present
+                                     ? rows[static_cast<std::size_t>(r)][slot].first
+                                     : -1);
+                S.values.push_back(present
+                                       ? rows[static_cast<std::size_t>(r)][slot].second
+                                       : 0.0);
+            }
+        }
+        S.offsets[static_cast<std::size_t>(s) + 1] =
+            static_cast<int32_t>(S.cols.size());
+    }
+    return S;
 }
 
 TriMatrix random_triangular(int64_t n, double density, bool lower, bool unit_diag,
@@ -244,11 +301,166 @@ bool BenchReport::measure(BenchRow row, const std::function<flagsparseStatus_t()
     return true;
 }
 
+namespace {
+
+// Baseline reasons are vendor strings and carry quotes and backslashes; emitting
+// them raw produces JSON that a reader silently truncates at the first quote.
+std::string json_escape(const std::string& in) {
+    std::string out;
+    out.reserve(in.size() + 8);
+    for (char c : in) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:   out += c;
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+bool BenchReport::measure_vs_baseline(
+    BenchRow row, const std::function<flagsparseStatus_t()>& once,
+    const std::function<double()>& verify,
+    const std::function<baseline::Status(baseline::Timing*)>& base, double flops) {
+    // 1. Our side. The first call also pays JIT compilation; it decides the
+    //    status and stays out of the samples.
+    const flagsparseStatus_t first = once();
+    if (first == FLAGSPARSE_STATUS_NOT_SUPPORTED) {
+        row.status = "not_supported";
+        row.detail = "operator declined this configuration on this backend";
+        rows_.push_back(std::move(row));
+        return false;
+    }
+    if (first != FLAGSPARSE_STATUS_SUCCESS) {
+        row.status = "failed";
+        row.detail = std::string("operator returned ") + status_name(first);
+        rows_.push_back(std::move(row));
+        return false;
+    }
+
+    // 2. The answer, BEFORE timing. The timing loop re-runs the operator many
+    //    times and an accumulating output (SpMM with beta != 0) would no longer
+    //    hold the value the oracle was computed for by the time we looked.
+    const double ratio = verify();
+    row.error_ratio = ratio < 0 ? 0.0 : ratio;
+    if (ratio < 0) {
+        row.accuracy = "unchecked";
+    } else if (ratio <= 1.0) {
+        row.accuracy = "pass";
+    } else {
+        row.accuracy = "fail";
+        row.status = "failed";
+        row.detail = "result outside tolerance: error_ratio " +
+                     std::to_string(ratio) + " (> 1)";
+        // Recorded and skipped for the speedup aggregate, but the sweep goes on.
+        rows_.push_back(std::move(row));
+        return false;
+    }
+
+    // 3. Our timing.
+    for (int i = 0; i < kWarmup; ++i) once();
+    dev_sync();
+    std::vector<double> samples;
+    samples.reserve(kIters);
+    for (int i = 0; i < kIters; ++i) {
+        const auto t0 = std::chrono::steady_clock::now();
+        once();
+        dev_sync();
+        const auto t1 = std::chrono::steady_clock::now();
+        samples.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+    }
+    std::sort(samples.begin(), samples.end());
+    row.status = "ok";
+    row.median_ms = samples[samples.size() / 2];
+    if (flops > 0 && row.median_ms > 0) row.gflops = flops / (row.median_ms * 1e6);
+
+    // 4. The vendor. Same warmup/iters, same median, so the two are divisible.
+    baseline::Timing bt;
+    const baseline::Status bs = base(&bt);
+    if (!bs.ok) {
+        row.baseline_status = baseline::available() ? "failed" : "unavailable";
+        row.baseline_detail = bs.reason;
+    } else {
+        row.baseline_status = "ok";
+        row.baseline_ms = bt.median_ms;
+        // The gate: a speedup is written only over an answer we checked and
+        // believed. "unchecked" withholds it too -- an unverified ratio is a
+        // number nobody should average.
+        if (row.accuracy == "pass" && bt.median_ms > 0 && row.median_ms > 0) {
+            row.speedup = bt.median_ms / row.median_ms;
+        }
+    }
+    rows_.push_back(std::move(row));
+    return true;
+}
+
 void BenchReport::skip(BenchRow row, const std::string& status,
                        const std::string& detail) {
     row.status = status;
     row.detail = detail;
     rows_.push_back(std::move(row));
+}
+
+// The accuracy artifact: one row per (variant, matrix) with the ratio that
+// decided it. Separate from the benchmark JSON because a precision reviewer
+// wants the ratios without the timings, and because summary.json names a
+// data_file per phase.
+void write_accuracy_json(const std::string& op, const std::vector<BenchRow>& rows) {
+    const char* dir = std::getenv("FLAGSPARSE_BENCH_OUT");
+    const std::string path =
+        std::string(dir ? dir : ".") + "/" + op + "_accuracy.json";
+    std::ofstream out(path);
+    if (!out) return;
+    const std::time_t now = std::time(nullptr);
+    char stamp[64];
+    std::strftime(stamp, sizeof(stamp), "%Y-%m-%dT%H:%M:%S", std::gmtime(&now));
+
+    out << "{\n  \"timestamp\": \"" << stamp << "\",\n";
+    out << "  \"operator\": \"" << op << "\",\n";
+    out << "  \"env\": {\"backend\": \"" << flagsparseGetBackendName()
+        << "\", \"arch\": \"" << device_arch()
+        << "\", \"version\": " << FLAGSPARSE_VERSION << "},\n";
+    out << "  \"reference\": \"host_fp64\",\n";
+    out << "  \"criterion\": \"max(|actual-ref|/(atol+rtol*|ref|)) <= 1  (spec 6.3)\",\n";
+    out << "  \"result\": [\n";
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        const BenchRow& r = rows[i];
+        out << "    {\"name\": \"" << r.name << "\"";
+        for (const auto& kv : r.tags) {
+            out << ", \"" << kv.first << "\": \"" << kv.second << "\"";
+        }
+        out << ", \"accuracy\": \"" << r.accuracy << "\"";
+        if (r.accuracy != "unchecked") {
+            out << ", \"error_ratio\": " << std::setprecision(6) << r.error_ratio;
+        } else {
+            out << ", \"error_ratio\": null";
+        }
+        out << ", \"status\": \"" << r.status << "\"";
+        if (!r.detail.empty()) {
+            out << ", \"detail\": \"" << json_escape(r.detail) << "\"";
+        }
+        out << "}" << (i + 1 < rows.size() ? ",\n" : "\n");
+    }
+    std::size_t passed = 0, failed = 0, unchecked = 0, skipped = 0, no_test = 0;
+    for (const BenchRow& r : rows) {
+        if (r.accuracy == "pass") ++passed;
+        else if (r.accuracy == "fail") ++failed;
+        else ++unchecked;
+        if (r.status == "not_implemented_in_test") ++no_test;
+        else if (r.status == "not_supported" ||
+                 r.status.rfind("skipped", 0) == 0) ++skipped;
+    }
+    out << "  ],\n  \"summary\": {\"rows\": " << rows.size()
+        << ", \"passed\": " << passed << ", \"failed\": " << failed
+        << ", \"unchecked\": " << unchecked << ", \"skipped\": " << skipped
+        << ", \"not_implemented_in_test\": " << no_test << "}\n}\n";
+    std::cout << "wrote " << path << "  (" << passed << " passed, " << failed
+              << " failed, " << unchecked << " unchecked)" << std::endl;
 }
 
 void BenchReport::write() const {
@@ -286,23 +498,111 @@ void BenchReport::write() const {
             out << ", \"median_ms\": " << std::setprecision(6) << r.median_ms
                 << ", \"gflops\": " << r.gflops;
         }
-        // No vendor sparse baseline is wired up on any backend yet, so these are
-        // null rather than 1.0 -- a fabricated baseline is worse than none.
-        out << ", \"baseline_ms\": null, \"speedup\": null}";
+        // The vendor comparison. Each of these is null rather than a stand-in
+        // value: a fabricated baseline is worse than none, and a speedup over an
+        // answer we did not check is worse still.
+        out << ", \"accuracy\": \"" << r.accuracy << "\"";
+        if (r.accuracy != "unchecked") {
+            out << ", \"error_ratio\": " << std::setprecision(6) << r.error_ratio;
+        } else {
+            out << ", \"error_ratio\": null";
+        }
+        out << ", \"baseline\": \"" << baseline::name() << "\"";
+        out << ", \"baseline_status\": \"" << r.baseline_status << "\"";
+        if (!r.baseline_detail.empty()) {
+            out << ", \"baseline_detail\": \"" << json_escape(r.baseline_detail) << "\"";
+        }
+        if (r.baseline_status == "ok") {
+            out << ", \"baseline_ms\": " << std::setprecision(6) << r.baseline_ms;
+        } else {
+            out << ", \"baseline_ms\": null";
+        }
+        if (r.speedup > 0) {
+            out << ", \"speedup\": " << std::setprecision(6) << r.speedup;
+        } else {
+            out << ", \"speedup\": null";
+        }
+        out << "}";
         out << (i + 1 < rows_.size() ? ",\n" : "\n");
     }
-    std::size_t ok = 0, unsupported = 0, failed = 0;
+    // not_implemented_in_test is counted APART from failed. A variant the
+    // manifest declares and this binary has no operand builder for is a gap in
+    // the test, not a defect in the library, and folding it into `failed` would
+    // report the library as broken for work it was never asked to do.
+    std::size_t ok = 0, unsupported = 0, failed = 0, acc_fail = 0, no_test = 0;
+    // The speedup aggregate is built ONLY from rows whose answer passed, which is
+    // the whole point of gating it. geomean, not mean: these are ratios, and a
+    // single 40x on a tiny matrix would otherwise carry the average.
+    std::vector<double> speedups;
     for (const BenchRow& r : rows_) {
         if (r.status == "ok") ++ok;
         else if (r.status == "not_supported") ++unsupported;
+        else if (r.status == "not_implemented_in_test") ++no_test;
         else ++failed;
+        if (r.accuracy == "fail") ++acc_fail;
+        if (r.speedup > 0 && r.accuracy == "pass") speedups.push_back(r.speedup);
     }
+    double geo = 0.0;
+    if (!speedups.empty()) {
+        double acc = 0.0;
+        for (double v : speedups) acc += std::log(v);
+        geo = std::exp(acc / static_cast<double>(speedups.size()));
+    }
+
     out << "  ],\n  \"summary\": {\"rows\": " << rows_.size()
         << ", \"ok\": " << ok << ", \"not_supported\": " << unsupported
         << ", \"failed\": " << failed
-        << ", \"baseline\": \"none (vendor sparse baseline not wired up)\"}\n}\n";
+        << ", \"not_implemented_in_test\": " << no_test
+        << ", \"accuracy_failed\": " << acc_fail
+        << ", \"baseline\": \"" << baseline::name() << "\""
+        << ", \"corpus\": \"" << corpus_tag() << "\""
+        // How many matrices the geomean is actually over. Without this the
+        // headline ratio hides how much of the corpus it represents.
+        << ", \"speedup_matrices\": " << speedups.size();
+    if (!speedups.empty()) {
+        out << ", \"speedup_geomean\": " << std::setprecision(6) << geo;
+    } else {
+        out << ", \"speedup_geomean\": null";
+    }
+    out << "}\n}\n";
+
     std::cout << "wrote " << path << "  (" << ok << " ok, " << unsupported
-              << " not_supported, " << failed << " failed)" << std::endl;
+              << " not_supported, " << failed << " failed";
+    if (no_test) std::cout << ", " << no_test << " declared but no test path";
+    if (acc_fail) std::cout << ", " << acc_fail << " out of tolerance";
+    std::cout << ")";
+    if (!speedups.empty()) {
+        std::cout << "  vs " << baseline::name() << ": geomean " << std::setprecision(4)
+                  << geo << "x over " << speedups.size() << " matrices";
+    } else if (!baseline::available()) {
+        std::cout << "  (no vendor baseline on this backend)";
+    }
+    std::cout << std::endl;
+
+    write_accuracy_json(op_, rows_);
+}
+
+std::size_t value_bytes(flagsparseDataType_t dtype) {
+    switch (dtype) {
+        case FLAGSPARSE_R_8I:   return 1;
+        case FLAGSPARSE_R_16F:
+        case FLAGSPARSE_R_16BF: return 2;
+        case FLAGSPARSE_R_32F:
+        case FLAGSPARSE_R_32I:  return 4;
+        case FLAGSPARSE_R_64F:
+        case FLAGSPARSE_C_32F:  return 8;
+        case FLAGSPARSE_C_64F:  return 16;
+        default:                return 0;
+    }
+}
+
+std::size_t index_bytes(flagsparseIndexType_t idx) {
+    switch (idx) {
+        case FLAGSPARSE_INDEX_16U: return 2;
+        case FLAGSPARSE_INDEX_32I: return 4;
+        case FLAGSPARSE_INDEX_64I: return 8;
+        default:                   return 0;
+    }
 }
 
 const char* status_name(flagsparseStatus_t st) {

@@ -25,13 +25,51 @@ endif()
 # The tests compile the backend adaptor themselves. libflagsparse.so exports
 # only the C API (visibility=hidden), so linking against its internals is not
 # possible by design -- and should not be made possible just to run tests.
-add_library(flagsparse_testsupport STATIC common.cpp ${FLAGSPARSE_ADAPTOR_SRC})
+# The variant registry, generated from conf/operators.yaml.
+#
+# This is what makes the manifest the operator list rather than a document beside
+# it: the benchmarks iterate what is generated here, so declaring a variant in the
+# YAML puts it in the sweep, and removing one takes it out. Growing 40 -> 115 is
+# an edit to the YAML plus a rebuild.
+# The generator needs an interpreter. Found HERE rather than at the pytest block
+# below, because that one runs later and leaving Python_EXECUTABLE empty made the
+# custom command a silent no-op: it printed "Generating..." and produced nothing,
+# and the failure surfaced 200 lines later as a missing header.
+find_package(Python COMPONENTS Interpreter QUIET)
+if(NOT Python_EXECUTABLE)
+    message(FATAL_ERROR
+        "No Python interpreter: ctest's variant registry is generated from "
+        "conf/operators.yaml by tools/gen_variants.py and cannot be built without "
+        "one. Install python3 with PyYAML, or pass -DPython_EXECUTABLE=...")
+endif()
+
+set(_fs_variants "${CMAKE_CURRENT_BINARY_DIR}/generated/variants.inc")
+add_custom_command(
+    OUTPUT "${_fs_variants}"
+    COMMAND "${Python_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/gen_variants.py"
+            --manifest "${CMAKE_SOURCE_DIR}/conf/operators.yaml"
+            --out "${_fs_variants}"
+    DEPENDS "${CMAKE_SOURCE_DIR}/conf/operators.yaml"
+            "${CMAKE_SOURCE_DIR}/tools/gen_variants.py"
+    COMMENT "Generating ctest variant registry from conf/operators.yaml"
+    VERBATIM)
+add_custom_target(flagsparse_variants DEPENDS "${_fs_variants}")
+
+# The vendor baseline a speedup is measured against. Its own CMakeLists is the
+# table of which backend has which sparse library; a backend without one compiles
+# the `none` provider, which answers "unavailable" with a reason.
+add_subdirectory(baseline)
+
+add_library(flagsparse_testsupport STATIC common.cpp corpus.cpp ${FLAGSPARSE_ADAPTOR_SRC})
+add_dependencies(flagsparse_testsupport flagsparse_variants)
 target_include_directories(flagsparse_testsupport
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
+           ${CMAKE_CURRENT_BINARY_DIR}/generated
            ${CMAKE_SOURCE_DIR}/include
            ${CMAKE_SOURCE_DIR}/src
            ${FLAGSPARSE_ADAPTOR_INCLUDES})
-target_link_libraries(flagsparse_testsupport PUBLIC flagsparse ${FLAGSPARSE_ADAPTOR_LIBS})
+target_link_libraries(flagsparse_testsupport
+    PUBLIC flagsparse flagsparse_ctest_baseline ${FLAGSPARSE_ADAPTOR_LIBS})
 
 # test_<operator>.cpp, one per API, in both directories (spec §6.2).
 # ctest names are "<phase>.<operator>" so `ctest -R accuracy` and `ctest -R spmv`
@@ -43,6 +81,9 @@ function(flagsparse_add_test phase op)
     endif()
     set(target "test_${phase}_${op}")
     add_executable(${target} "${src}")
+    add_dependencies(${target} flagsparse_variants)
+    target_include_directories(${target}
+        PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
     target_link_libraries(${target} PRIVATE flagsparse_testsupport GTest::gtest_main)
     set_target_properties(${target} PROPERTIES
         OUTPUT_NAME "test_${op}"
@@ -82,7 +123,6 @@ if(FLAGSPARSE_CTEST_PYTEST AND FLAGSPARSE_PYTHON_SRC)
     get_filename_component(_fs_py_root "${FLAGSPARSE_PYTHON_SRC}" DIRECTORY)
     set(_fs_pytest_dir "${_fs_py_root}/tests/pytest")
     if(EXISTS "${_fs_pytest_dir}")
-        find_package(Python COMPONENTS Interpreter QUIET)
         if(Python_Interpreter_FOUND)
             file(GLOB _fs_pytest_files "${_fs_pytest_dir}/test_*.py")
             foreach(_file ${_fs_pytest_files})

@@ -40,7 +40,13 @@ _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 import _bootstrap  # noqa: F401,E402  -- import side effect puts flagsparse on sys.path
 
 from flagsparse.sparse_operations.spmv_csr import (  # noqa: E402,F401
+    _spmv_csr_complex_kernel,
     _spmv_csr_real_kernel,
 )
 
-__all__ = ["_spmv_csr_real_kernel"]
+# The complex kernel is a separate function rather than a dtype constexpr on the
+# real one, so no jit wrapper is involved: the dispatch layer picks by name.
+# Complex operands are interleaved real/imag pairs of the component dtype, and
+# alpha/beta arrive split the same way -- Triton has no complex type, and this is
+# what the Python package already does (torch.view_as_real).
+__all__ = ["_spmv_csr_real_kernel", "_spmv_csr_complex_kernel"]

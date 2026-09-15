@@ -17,6 +17,7 @@
 
 #include <gtest/gtest.h>
 
+#include <complex>
 #include <memory>
 
 #include "common.hpp"
@@ -390,6 +391,151 @@ RunResult run_spmv_fmt(flagsparseHandle_t handle, const CsrMatrix& A,
     flagsparseDestroyDnVec(vecX);
     flagsparseDestroySpMat(matA);
     return out;
+}
+
+// Complex SpMV. A separate runner rather than a template parameter: complex
+// operands are interleaved real/imag pairs of the COMPONENT dtype, and alpha and
+// beta arrive split the same way -- there is no single T that covers both.
+template <typename R>
+RunResult run_spmv_complex(flagsparseHandle_t handle, const CsrMatrix& A,
+                           flagsparseFormat_t format, flagsparseDataType_t dtype,
+                           std::complex<double> alpha, std::complex<double> beta,
+                           uint32_t seed,
+                           flagsparseSpMVAlg_t alg = FLAGSPARSE_SPMV_ALG_DEFAULT) {
+    using C64 = std::complex<double>;
+    RunResult out;
+    const auto m = static_cast<std::size_t>(A.rows);
+    const auto n = static_cast<std::size_t>(A.cols);
+
+    std::mt19937 rng(seed);
+    std::normal_distribution<double> dist(0.0, 1.0);
+    std::vector<C64> a_vals(static_cast<std::size_t>(A.nnz));
+    for (std::size_t i = 0; i < a_vals.size(); ++i) {
+        a_vals[i] = C64(A.values[i], dist(rng));
+    }
+    std::vector<C64> x64(n), y64(m);
+    for (auto& v : x64) v = C64(dist(rng), dist(rng));
+    for (auto& v : y64) v = C64(dist(rng), dist(rng));
+
+    std::vector<R> a_dev(a_vals.size() * 2), x_dev(n * 2), y_dev(m * 2);
+    for (std::size_t i = 0; i < a_vals.size(); ++i) {
+        a_dev[i * 2]     = static_cast<R>(a_vals[i].real());
+        a_dev[i * 2 + 1] = static_cast<R>(a_vals[i].imag());
+    }
+    for (std::size_t i = 0; i < n; ++i) {
+        x_dev[i * 2] = static_cast<R>(x64[i].real());
+        x_dev[i * 2 + 1] = static_cast<R>(x64[i].imag());
+    }
+    for (std::size_t i = 0; i < m; ++i) {
+        y_dev[i * 2] = static_cast<R>(y64[i].real());
+        y_dev[i * 2 + 1] = static_cast<R>(y64[i].imag());
+    }
+
+    DeviceBuffer d_val = DeviceBuffer::from(a_dev);
+    DeviceBuffer d_col = DeviceBuffer::from(A.indices);
+    DeviceBuffer d_ptr = DeviceBuffer::from(A.indptr);
+    DeviceBuffer d_row = DeviceBuffer::from(coo_row_indices_of(A));
+    DeviceBuffer d_x   = DeviceBuffer::from(x_dev);
+    DeviceBuffer d_y   = DeviceBuffer::from(y_dev);
+
+    flagsparseSpMatDescr_t matA = nullptr;
+    flagsparseDnVecDescr_t vecX = nullptr, vecY = nullptr;
+    out.status =
+        (format == FLAGSPARSE_FORMAT_COO)
+            ? flagsparseCreateCoo(&matA, A.rows, A.cols, A.nnz, d_row.get(),
+                                  d_col.get(), d_val.get(), FLAGSPARSE_INDEX_32I,
+                                  FLAGSPARSE_INDEX_BASE_ZERO, dtype)
+            : flagsparseCreateCsr(&matA, A.rows, A.cols, A.nnz, d_ptr.get(),
+                                  d_col.get(), d_val.get(), FLAGSPARSE_INDEX_32I,
+                                  FLAGSPARSE_INDEX_32I, FLAGSPARSE_INDEX_BASE_ZERO,
+                                  dtype);
+    if (out.status != FLAGSPARSE_STATUS_SUCCESS) return out;
+    flagsparseCreateDnVec(&vecX, A.cols, d_x.get(), dtype);
+    flagsparseCreateDnVec(&vecY, A.rows, d_y.get(), dtype);
+
+    const R alpha_t[2] = {static_cast<R>(alpha.real()), static_cast<R>(alpha.imag())};
+    const R beta_t[2]  = {static_cast<R>(beta.real()),  static_cast<R>(beta.imag())};
+    size_t buffer_size = 0;
+    out.status = flagsparseSpMV_bufferSize(handle, FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+                                           alpha_t, matA, vecX, beta_t, vecY, dtype, alg,
+                                           &buffer_size);
+    DeviceBuffer scratch(buffer_size);
+    if (out.status == FLAGSPARSE_STATUS_SUCCESS) {
+        out.status = flagsparseSpMV_preprocess(handle,
+                                               FLAGSPARSE_OPERATION_NON_TRANSPOSE,
+                                               alpha_t, matA, vecX, beta_t, vecY, dtype,
+                                               alg, scratch.get());
+    }
+    if (out.status == FLAGSPARSE_STATUS_SUCCESS) {
+        out.status = flagsparseSpMV(handle, FLAGSPARSE_OPERATION_NON_TRANSPOSE, alpha_t,
+                                    matA, vecX, beta_t, vecY, dtype, alg, scratch.get());
+    }
+    dev_sync();
+
+    if (out.status == FLAGSPARSE_STATUS_SUCCESS) {
+        const std::vector<R> got = d_y.download<R>(m * 2);
+        // Real and imaginary parts compared as one flat vector: the result is
+        // wrong if either component is.
+        std::vector<double> actual, ref;
+        actual.reserve(m * 2); ref.reserve(m * 2);
+        for (int64_t r = 0; r < A.rows; ++r) {
+            C64 acc(0.0, 0.0);
+            for (int32_t p = A.indptr[static_cast<std::size_t>(r)];
+                 p < A.indptr[static_cast<std::size_t>(r) + 1]; ++p) {
+                acc += a_vals[static_cast<std::size_t>(p)] *
+                       x64[static_cast<std::size_t>(A.indices[static_cast<std::size_t>(p)])];
+            }
+            C64 want = alpha * acc;
+            if (beta != C64(0.0, 0.0)) want += beta * y64[static_cast<std::size_t>(r)];
+            actual.push_back(static_cast<double>(got[static_cast<std::size_t>(r) * 2]));
+            actual.push_back(static_cast<double>(got[static_cast<std::size_t>(r) * 2 + 1]));
+            ref.push_back(want.real());
+            ref.push_back(want.imag());
+        }
+        out.strict_ratio = max_error_ratio(actual, ref, default_tolerance(dtype));
+        if (out.strict_ratio > 1.0) {
+            out.relaxed_ratio = max_error_ratio(actual, ref, relaxed_tolerance(dtype));
+            out.relaxed_used = true;
+        }
+    }
+    flagsparseDestroyDnVec(vecY);
+    flagsparseDestroyDnVec(vecX);
+    flagsparseDestroySpMat(matA);
+    return out;
+}
+
+// The four complex variants the operator registry lists: {csr, coo} x {c32, c64}.
+TEST_F(SpMVAccuracy, ComplexCsrAndCoo) {
+    for (auto shape : {std::pair<int64_t, int64_t>{64, 96}, {257, 129}}) {
+        const CsrMatrix A = random_csr(shape.first, shape.second, 0.05, 1234);
+        for (auto fmt : {FLAGSPARSE_FORMAT_CSR, FLAGSPARSE_FORMAT_COO}) {
+            const char* f = (fmt == FLAGSPARSE_FORMAT_COO) ? "coo" : "csr";
+            expect_close(run_spmv_complex<float>(handle.h, A, fmt, FLAGSPARSE_C_32F,
+                                                 std::complex<double>(1.0, 0.0),
+                                                 std::complex<double>(0.0, 0.0), 7),
+                         (std::string(f) + "_c32").c_str(), handle.h);
+            // Complex alpha AND beta: only their real halves reaching the kernel
+            // would still look plausible without this.
+            expect_close(run_spmv_complex<double>(handle.h, A, fmt, FLAGSPARSE_C_64F,
+                                                  std::complex<double>(1.5, -0.75),
+                                                  std::complex<double>(-0.5, 0.25), 11),
+                         (std::string(f) + "_c64_alpha_beta").c_str(), handle.h);
+        }
+    }
+}
+
+// COO_ALG2 routes complex through the CSR kernel now, so the two COO routes must
+// agree on complex the way they already do on real.
+TEST_F(SpMVAccuracy, ComplexCooRoutesAgree) {
+    const CsrMatrix A = random_csr(200, 150, 0.04, 31);
+    for (auto alg : {FLAGSPARSE_SPMV_COO_ALG1, FLAGSPARSE_SPMV_COO_ALG2}) {
+        expect_close(run_spmv_complex<double>(handle.h, A, FLAGSPARSE_FORMAT_COO,
+                                              FLAGSPARSE_C_64F,
+                                              std::complex<double>(1.75, 0.5),
+                                              std::complex<double>(-1.0, 0.0), 13, alg),
+                     alg == FLAGSPARSE_SPMV_COO_ALG2 ? "coo_c64_alg2" : "coo_c64_alg1",
+                     handle.h);
+    }
 }
 
 TEST_F(SpMVAccuracy, CooMatchesHostReference) {
