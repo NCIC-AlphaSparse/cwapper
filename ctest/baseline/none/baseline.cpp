@@ -60,7 +60,10 @@ Status spmm_csr(const DeviceCsr&, const void*, int64_t, int64_t, void*, int64_t,
                 flagsparseOperation_t, int, int, Timing*) { return none(); }
 Status sddmm_csr(const DeviceCsr&, const void*, int64_t, int64_t, const void*,
                  int64_t, const void*, const void*, int, int, Timing*) { return none(); }
-Status spgemm_csr(const DeviceCsr&, const void*, const void*, int, int, Timing*) { return none(); }
+void free_csr(BaselineCsrOut*) {}   // nothing was ever allocated
+
+Status spgemm_csr(const DeviceCsr&, const void*, const void*, int, int, Timing*,
+                  BaselineCsrOut*) { return none(); }
 Status spsv_csr(const DeviceCsr&, const void*, void*, const void*,
                 flagsparseFillMode_t, flagsparseDiagType_t, flagsparseOperation_t,
                 int, int, Timing*) { return none(); }

@@ -87,7 +87,10 @@ Status sddmm_csr(const DeviceCsr&, const void*, int64_t, int64_t, const void*,
                    "the dense library rather than a sparse kernel");
 }
 
-Status spgemm_csr(const DeviceCsr&, const void*, const void*, int, int, Timing*) {
+void free_csr(BaselineCsrOut*) {}   // nothing was ever allocated
+
+Status spgemm_csr(const DeviceCsr&, const void*, const void*, int, int, Timing*,
+                  BaselineCsrOut*) {
     return pending("no direct CANN counterpart");
 }
 

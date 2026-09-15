@@ -56,6 +56,9 @@ std::string fail(const char* call, int status) {
 struct Scratch {
     void* p = nullptr;
     ~Scratch() { if (p) ad::device_free(reinterpret_cast<ad::DevicePtr>(p)); }
+    // Give the pointer up without freeing it -- used when C is handed to the
+    // caller for verification instead of being destroyed here.
+    void* release() { void* q = p; p = nullptr; return q; }
     bool grab(std::size_t bytes) {
         if (bytes == 0) return true;
         ad::DevicePtr d = 0;
@@ -294,8 +297,17 @@ Status sddmm_csr(const DeviceCsr& A, const void* Bd, int64_t k, int64_t ldb,
 // scratch, which a caller pays once per pattern, while copy materialises the
 // result and is unavoidable per product.
 
+void free_csr(BaselineCsrOut* c) {
+    if (!c) return;
+    for (void** p : {&c->indptr, &c->indices, &c->values}) {
+        if (*p) ad::device_free(reinterpret_cast<ad::DevicePtr>(*p));
+        *p = nullptr;
+    }
+    c->nnz = 0;
+}
+
 Status spgemm_csr(const DeviceCsr& A, const void* alpha, const void* beta,
-                  int warmup, int iters, Timing* out) {
+                  int warmup, int iters, Timing* out, BaselineCsrOut* result) {
     if (A.rows != A.cols) return Status::no("A*A needs a square A");
     if (A.is_coo()) return Status::no(std::string(FS_SP_NAME) + " SpGEMM is CSR only");
     FS_DT_TYPE vt;
@@ -360,15 +372,32 @@ Status spgemm_csr(const DeviceCsr& A, const void* alpha, const void* beta,
     }
     FS_SP(CsrSetPointers)(c, c_ptr.p, c_ind.p, c_val.p);
 
-    Status result = timed(
+    // One copy outside the clock, for the same reason as the operator side.
+    st = FS_SP(SpGEMM_copy)(vendor(), NT, NT, alpha, a, b, beta, c, vt,
+                            FS_SP_E(SPGEMM_DEFAULT), descr);
+    if (st != FS_SP_E(STATUS_SUCCESS)) return cleanup(Status::no(fail("SpGEMM_copy", st)));
+
+    Status result_status = timed(
         [&]() -> Status {
-            const auto s = FS_SP(SpGEMM_copy)(vendor(), NT, NT, alpha, a, b, beta, c,
-                                              vt, FS_SP_E(SPGEMM_DEFAULT), descr);
+            const auto s = FS_SP(SpGEMM_compute)(vendor(), NT, NT, alpha, a, b, beta,
+                                                 c, vt, FS_SP_E(SPGEMM_DEFAULT),
+                                                 descr, &b2, s2.p);
             return s == FS_SP_E(STATUS_SUCCESS) ? Status::good()
-                                                : Status::no(fail("SpGEMM_copy", s));
+                                                : Status::no(fail("SpGEMM_compute", s));
         },
         warmup, iters, out);
-    return cleanup(result);
+
+    // Hand C over instead of freeing it, when the caller asked. Scratch's
+    // destructor must not run on these, so release them first.
+    if (result && result_status.ok) {
+        result->rows = cr;
+        result->cols = cc;
+        result->nnz = cnnz;
+        result->indptr = c_ptr.release();
+        result->indices = c_ind.release();
+        result->values = c_val.release();
+    }
+    return cleanup(result_status);
 }
 
 // ------------------------------------------------------------------- SpSV

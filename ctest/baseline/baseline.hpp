@@ -120,10 +120,29 @@ Status sddmm_csr(const DeviceCsr& A, const void* Bd, int64_t k, int64_t ldb,
                  const void* Cd, int64_t ldc, const void* alpha, const void* beta,
                  int warmup, int iters, Timing* out);
 
-// C = A * A. The baseline owns C's buffers internally (their size is discovered,
-// not known up front) and frees them before returning; only the timing escapes.
+// C's arrays as the baseline produced them. Allocated by the baseline because
+// their size is DISCOVERED -- the caller cannot size them in advance, which is
+// what makes SpGEMM different from every other entry point here.
+//
+// Ownership passes to the caller when `result` is non-null below; free it with
+// free_csr(). The point of handing it over is accuracy: without it the vendor's
+// answer is unreachable, `baseline_accuracy` stays "unchecked" forever, and spec
+// 6.3.1's relaxed tier -- which requires evidence that the VENDOR also missed the
+// strict tolerance -- can never be awarded for this operator.
+struct BaselineCsrOut {
+    void* indptr = nullptr;
+    void* indices = nullptr;
+    void* values = nullptr;
+    int64_t rows = 0, cols = 0, nnz = 0;
+};
+
+void free_csr(BaselineCsrOut* c);
+
+// C = A * A. Pass `result` to take ownership of C and check the vendor's answer;
+// pass nullptr to have the baseline free it (only the timing escapes).
 Status spgemm_csr(const DeviceCsr& A, const void* alpha, const void* beta,
-                  int warmup, int iters, Timing* out);
+                  int warmup, int iters, Timing* out,
+                  BaselineCsrOut* result = nullptr);
 
 Status spsv_csr(const DeviceCsr& A, const void* x, void* y, const void* alpha,
                 flagsparseFillMode_t fill, flagsparseDiagType_t diag,
