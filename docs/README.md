@@ -73,6 +73,15 @@ Python 层的直接调用**（那一层不经过 `_bootstrap`）。跑 `ctest -R
 
 ### 两个仓库是配套的，不是任意版本组合
 
+```
+FlagSparse（Python/Triton 内核）  https://github.com/NCIC-AlphaSparse/FlagSparse
+c_fs / cwapper（本仓库，C API）   https://github.com/NCIC-AlphaSparse/cwapper
+libtriton_jit（JIT 桥，子模块）   https://github.com/Artlesbol/libtriton_jit
+```
+
+依赖是**单向**的：本仓库通过 `FLAGSPARSE_PYTHON_SRC` 找到 FlagSparse 的内核，反过来
+FlagSparse 不依赖本仓库，单独跑 `run_flagsparse_pytest.py` 照常工作。
+
 C API 为对齐 cuSPARSE，往 **FlagSparse 侧的内核**里加了参数和 constexpr。它们都设计成
 在 Python 路径上折叠掉（传 1/0、`False`），所以 Python 侧生成的代码不变——但**旧的
 FlagSparse 配新的 c_fs 会直接 `CompilationError`**，因为 C 侧拼的签名多出参数。
@@ -176,6 +185,80 @@ JIT 里一句 `number of argument mismatch`，两个副本的名字一个都没�
 三角往往病态得离谱，不这么做量到的是矩阵而不是内核。
 
 工具不注册进 ctest：一次扫描要几分钟，而且依赖仓库里没有的矩阵。
+
+
+## 算子清单：从哪来，怎么决定报告出什么
+
+这一节是**测试范围的唯一真源**，改清单就改范围，不用动测试代码。
+
+### 三份文件，三种口径
+
+| 文件 | 内容 | 作用 |
+|---|---|---|
+| `算子列表注册修改.xlsx`（仓库外） | 40 个变体，"新算子列表"一列 | **交付口径**，决定报告默认出什么 |
+| `算子对比结果_合并变体.csv`（仓库外） | 115 个变体，含 trans/conj/col 布局 | 对齐 cuSPARSE 的完整矩阵，未来目标 |
+| `conf/operators.yaml`（本仓库） | 22 个算子组 → 60 个变体 | 实现细节 + 归属标记 |
+
+三个数不是包含关系，别混：**115** 是完整口径（含 `non`/`trans`/`conj` 与 row/col 布局），
+**42** 是当前交付（xlsx 的 40 加上 gather/scatter 的 f16），**60** 是本仓库能生成的变体
+（交付 40 + 保留 20）。42 与 40 差的两个是 `sddmm_csr` 的 c32/c64：交付清单要，但**没有
+复数 SDDMM 内核**（实测 `x dtype must be torch.float32 or torch.float64`）。
+
+### `reporting` 字段
+
+`conf/operators.yaml` 每个算子带一个 `reporting`：
+
+```yaml
+- id: spmv_csr
+  reporting: delivery          # 在交付清单里，进默认报告
+- id: spmv_csc
+  reporting: retained          # 有实现、ctest/accuracy 有覆盖，但不进默认报告
+- id: spsm_csr
+  reporting: delivery
+  delivery_dtypes: [f32, f64]  # 内核也支持复数，但交付清单只要这两档
+- id: sddmm_csr
+  delivery_gaps: [c64, c128]   # 交付清单要，但没有内核
+```
+
+`retained` **不是"删掉"**：那些算子有实现也有通过的精度测试，从清单里删会让已有的测试
+变成没有归属的孤儿。它们照常构建、照常测试，只是被挡在默认报告之外。
+
+`delivery_gaps` 记录"清单要但没实现"的部分。**不把它们写进 `dtypes`** 是有意的：那样会
+生成运行期必然失败的变体，读起来像回归，而不是"还没做"。
+
+### 流程
+
+```bash
+# 1. 清单 -> 变体表（构建时由 CMake 自动执行，无需手动跑）
+python3 tools/gen_variants.py --manifest conf/operators.yaml \
+        --out build/ctest/generated/variants.inc
+
+# 2. 跑测试（8 个二进制迭代变体表，而不是各自的硬编码表）
+FLAGSPARSE_MATRIX_DIR=/path/to/mtx FLAGSPARSE_BENCH_OUT=./bench \
+    ctest --test-dir build -R benchmark
+
+# 3. 交付报告：默认只出 40 行；--all 看全部 60
+python3 tools/report.py --bench-dir ./bench --csv delivery.csv
+
+# 4. summary.json：与 FlagSparse 的 run_flagsparse_pytest.py 同 schema
+python3 tools/write_summary.py --bench-dir ./bench --out ./bench
+
+# 5. 一致性检查：清单与实现是否漂了（--strict 可进 CI）
+python3 tools/check_manifest.py --bench-dir ./bench
+```
+
+**加一个算子 = 改 YAML + 重新构建**，测试代码不动。这也是 40 → 115 的路径：
+`gen_variants.py` 改成按 CSV 的切分展开即可，但那需要 benchmark 增加 `trans`/`conj`
+方向和 col 布局的代码路径，那是实打实的工作量。
+
+### 变体没测到时会怎样
+
+清单声明了、但 benchmark 没有对应 operand builder 的变体，**会产出一行
+`not_implemented_in_test`**，带着缺什么的说明，而不是静默缺席。这一类**单独计数，不算进
+`failed`**——测试的缺口不是库的缺陷，混在一起会把库报成坏了。
+
+`check_manifest.py` 会把清单与实现之间的每一处不一致列出来。这个机制建立之前，两者漂了
+**34 处**没有任何东西发现。
 
 ## 厂商基线与加速比
 
