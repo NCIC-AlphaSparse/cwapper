@@ -58,6 +58,38 @@ STATUS_TO_FLAGGEMS = {
 # rather than being mangled into a real dtype it is not.
 DTYPE_ALIASES = {"f32": "fp32", "f64": "fp64", "f16": "fp16", "bf16": "bf16"}
 
+# The delivery list (算子列表注册修改.xlsx, "新算子列表") names each VARIANT as an
+# operator: `spmv_csr_f32_int_non`, not `spmv`. Keying `result` that way is what
+# makes the 40 rows appear in a FlagGems-shaped summary and HTML without changing
+# either format -- one entry per variant, exactly as the list is written.
+#
+# The trailing parts encode what the delivery list fixes: `int` (index type,
+# covering i32/i64 through the descriptor), then the operation directions. Every
+# delivery variant is the non-transposed, row-major case, so those are constants
+# here -- when trans/conj/col are implemented they become real dimensions and
+# this mapping grows.
+VARIANT_SUFFIX = {
+    "gather": "int",
+    "scatter": "int",
+    "spmv": "int_non",
+    "spsv": "int_non",
+    "spmm": "int_non_non_row",
+    "spsm": "int_non_non_row",
+    "sddmm": "int_non_non_row",
+    "spgemm": "int_non_non",
+}
+
+
+def variant_name(row):
+    """The delivery-list name for a measured row, e.g. spmv_csr_f32_int_non."""
+    op = row.get("operator") or row.get("_op", "")
+    fam = row.get("_op", "")
+    dt = row.get("dtype", "")
+    suffix = VARIANT_SUFFIX.get(fam, "int")
+    # `operator` is the manifest id and already carries the format (spmv_csr);
+    # gather/scatter have no format in their name.
+    return f"{op}_{dt}_{suffix}"
+
 
 def flaggems_status(s):
     return STATUS_TO_FLAGGEMS.get(str(s or ""), str(s or "Unknown"))
@@ -124,8 +156,19 @@ def shape_key(row):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--bench-dir", type=pathlib.Path, required=True)
-    ap.add_argument("--out", type=pathlib.Path, required=True)
+    ap.add_argument("--bench-dir", type=pathlib.Path,
+                    default=pathlib.Path("capi_results"),
+                    help="directory of *_benchmark.json (default: capi_results/)")
+    # Defaults to capi_results/ beside pytest_results/, which is where the
+    # Python runner writes. Two reasons it is a separate directory rather than a
+    # shared one: the two summaries are the same FILENAME with different
+    # granularity (25 operators there, the delivery variants here), so sharing a
+    # directory means one silently overwrites the other; and CI uploads whole
+    # directories, so separate names keep both artifacts.
+    ap.add_argument("--out", type=pathlib.Path, default=pathlib.Path("capi_results"),
+                    help="output directory (default: capi_results/)")
+    ap.add_argument("--no-html", action="store_true",
+                    help="skip result.html (the JSON is still written)")
     ap.add_argument("--all", action="store_true",
                     help="include retained variants; the default is the "
                          "delivery list only (算子列表注册修改.xlsx)")
@@ -144,6 +187,8 @@ def main():
         for r in rows:
             r["_backend"] = env.get("backend", "")
             r["_arch"] = str(env.get("arch", ""))
+            # The benchmark family, used to pick the delivery-list suffix.
+            r["_op"] = op
         # Delivery scope. Rows from a build before the `reporting` tag existed
         # have no such key; treating those as delivery would silently fold the
         # retained variants into the headline numbers, so they are EXCLUDED and
@@ -159,28 +204,13 @@ def main():
         if not rows:
             continue
 
-        # ---- performance: dtype -> shape -> {base, gems, speedup}
-        data = {}
+        # Group by variant: one summary entry per delivery-list name.
+        by_variant = {}
         for r in rows:
-            if r.get("status") != "ok":
-                continue
-            dt = flag_gems_dtype(r.get("dtype", "?"))
-            entry = data.setdefault(dt, {"result": "Unknown", "details": {},
-                                         "speedup": 0.0, "_sp": []})
-            entry["details"][shape_key(r)] = {
-                "base": float(r.get("baseline_ms") or 0.0),
-                "gems": float(r.get("median_ms") or 0.0),
-                "speedup": float(r.get("speedup") or 0.0),
-            }
-            if r.get("speedup"):
-                entry["_sp"].append(float(r["speedup"]))
-        for dt, entry in data.items():
-            sp = entry.pop("_sp")
-            # Arithmetic mean, matching what the Python runner reports per dtype.
-            entry["speedup"] = sum(sp) / len(sp) if sp else 0.0
-            entry["result"] = "Passed" if sp else "Unknown"
+            by_variant.setdefault(variant_name(r), []).append(r)
 
-        # ---- accuracy: from the operator's own accuracy artifact when the
+        # ---- accuracy artifact, indexed by variant so each entry cites the
+        # rows that decided it. From the operator's own file when the
         # sweep wrote one, so the phase names a file that really holds the
         # ratios. Falls back to the benchmark rows (same numbers, same run) for
         # a JSON produced before that artifact existed.
@@ -189,55 +219,71 @@ def main():
         if acc_path.exists():
             acc_rows = json.loads(acc_path.read_text()).get("result", [])
             acc_file = acc_path.name
-        checked = [r for r in acc_rows if r.get("accuracy") in ("pass", "fail")]
-        passed = [r for r in acc_rows if r.get("accuracy") == "pass"]
-        failed = [r for r in acc_rows if r.get("accuracy") == "fail"]
-        skipped = [r for r in acc_rows if r.get("status", "").startswith("skipped")
-                   or r.get("status") == "not_supported"]
-        details = {}
-        if failed:
-            details["failed"] = [
-                {"name": r.get("name"), "error_ratio": r.get("error_ratio"),
-                 "detail": r.get("detail")} for r in failed]
-        unsupported = [r for r in acc_rows if r.get("status") == "not_supported"]
-        if unsupported:
-            details["not_supported"] = [
-                {"name": r.get("name"), "detail": r.get("detail")}
-                for r in unsupported]
+        # One entry per variant. The accuracy rows are grouped the same way, so
+        # each entry's counts come from the rows that actually decided it rather
+        # than from an operator-wide total that would hide which variant failed.
+        acc_by_variant = {}
+        for r in acc_rows:
+            acc_by_variant.setdefault(variant_name(r), []).append(r)
 
-        acc_status = "Failed" if failed else ("Passed" if passed else "Skipped")
-        perf_status = "Passed" if any(r.get("speedup") for r in rows) else "Skipped"
+        for vname, vrows in by_variant.items():
+            va = acc_by_variant.get(vname, vrows)
+            # pass_relaxed counts as passed: spec 6.3.1 calls it a PASS, and it
+            # is only awarded when the vendor missed the strict tolerance too.
+            v_passed = [r for r in va
+                        if r.get("accuracy") in ("pass", "pass_relaxed")]
+            v_failed = [r for r in va if r.get("accuracy") == "fail"]
+            v_skipped = [r for r in va
+                         if str(r.get("status", "")).startswith("skipped")
+                         or r.get("status") == "not_supported"]
 
-        result[op] = {
-            "customized": True,
-            "accuracy": {
-                "total": len(acc_rows),
-                "skipped": len(skipped),
-                "failed": len(failed),
-                "passed": len(passed),
-                "details": details,
-                "status": flaggems_status(acc_status),
-                "exit_code": 1 if failed else 0,
-                "duration": 0.0,
-                # The file the accuracy verdict actually came from. The Python
-                # runner writes a separate <op>/accuracy_result.json because its
-                # two phases are two pytest runs; here both phases are read off
-                # ONE benchmark run -- every row checks its result against the
-                # host fp64 oracle before timing it. Pointing at a conventional
-                # path that this repo never writes would be a dangling reference
-                # in a file whose whole purpose is to be machine-read.
-                "data_file": acc_file,
-            },
-            "performance": {
-                "duration": 0.0,
-                "exit_code": 0,
-                "data_file": path.name,
-                "data": data,
-                "status": flaggems_status(perf_status),
-                "test_case": "matrix",
-            },
-            "labels": ["flagsparse", "c_api"],
-        }
+            dt = flag_gems_dtype(vrows[0].get("dtype", "?"))
+            det, sp = {}, []
+            for r in vrows:
+                if r.get("status") != "ok":
+                    continue
+                det[shape_key(r)] = {
+                    "base": float(r.get("baseline_ms") or 0.0),
+                    "gems": float(r.get("median_ms") or 0.0),
+                    "speedup": float(r.get("speedup") or 0.0),
+                }
+                if r.get("speedup"):
+                    sp.append(float(r["speedup"]))
+
+            v_details = {}
+            if v_failed:
+                v_details["failed"] = [
+                    {"name": r.get("name"), "error_ratio": r.get("error_ratio"),
+                     "detail": r.get("detail")} for r in v_failed]
+
+            acc_status = ("Failed" if v_failed
+                          else ("Passed" if v_passed else "Skipped"))
+            result[vname] = {
+                "customized": True,
+                "accuracy": {
+                    "total": len(va),
+                    "skipped": len(v_skipped),
+                    "failed": len(v_failed),
+                    "passed": len(v_passed),
+                    "details": v_details,
+                    "status": flaggems_status(acc_status),
+                    "exit_code": 1 if v_failed else 0,
+                    "duration": 0.0,
+                    "data_file": acc_file,
+                },
+                "performance": {
+                    "duration": 0.0,
+                    "exit_code": 0,
+                    "data_file": path.name,
+                    "data": {dt: {"result": "Passed" if sp else "Unknown",
+                                  "details": det,
+                                  "speedup": sum(sp) / len(sp) if sp else 0.0}},
+                    "status": flaggems_status("Passed" if sp else "Skipped"),
+                    "test_case": "matrix",
+                },
+                "labels": ["flagsparse", "c_api"],
+            }
+
 
     summary = {
         "timestamp": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -247,7 +293,20 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
     out = args.out / "summary.json"
     out.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-    print(f"wrote {out}  ({len(result)} operators, {len(all_rows)} rows)")
+    print(f"wrote {out}  ({len(result)} variants, {len(all_rows)} rows)")
+
+    # The HTML describes the same run, so it is rendered here rather than by a
+    # second process that re-reads the JSON -- one command, no way for the two
+    # to drift apart. A rendering failure must not cost the JSON, which is the
+    # machine-readable artifact and the one CI collects.
+    if not args.no_html:
+        try:
+            sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+            import write_html
+            html_path, n = write_html.render(summary, args.out / "result.html")
+            print(f"wrote {html_path}  ({n} variants)")
+        except Exception as exc:  # noqa: BLE001 - reported, never fatal
+            print(f"  result.html not written: {type(exc).__name__}: {exc}")
 
 
 if __name__ == "__main__":

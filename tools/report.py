@@ -56,7 +56,9 @@ def geomean(vals):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--bench-dir", type=pathlib.Path, required=True)
+    ap.add_argument("--bench-dir", type=pathlib.Path,
+                    default=pathlib.Path("capi_results"),
+                    help="directory of *_benchmark.json (default: capi_results/)")
     ap.add_argument("--csv", type=pathlib.Path)
     ap.add_argument("--all", action="store_true",
                     help="include retained variants; default is the delivery "

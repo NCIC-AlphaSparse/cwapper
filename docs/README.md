@@ -240,8 +240,10 @@ FLAGSPARSE_MATRIX_DIR=/path/to/mtx FLAGSPARSE_BENCH_OUT=./bench \
 # 3. 交付报告：默认只出 40 行；--all 看全部 60
 python3 tools/report.py --bench-dir ./bench --csv delivery.csv
 
-# 4. summary.json：与 FlagSparse 的 run_flagsparse_pytest.py 同 schema
-python3 tools/write_summary.py --bench-dir ./bench --out ./bench
+# 4. summary.json + result.html：与 FlagSparse 的 run_flagsparse_pytest.py 同 schema
+#    零参数即可，默认读写 capi_results/
+python3 tools/write_summary.py              # 同时产出 result.html（--no-html 可跳过）
+python3 tools/write_html.py                 # 只重渲染 HTML
 
 # 5. 一致性检查：清单与实现是否漂了（--strict 可进 CI）
 python3 tools/check_manifest.py --bench-dir ./bench
@@ -250,6 +252,26 @@ python3 tools/check_manifest.py --bench-dir ./bench
 **加一个算子 = 改 YAML + 重新构建**，测试代码不动。这也是 40 → 115 的路径：
 `gen_variants.py` 改成按 CSV 的切分展开即可，但那需要 benchmark 增加 `trans`/`conj`
 方向和 col 布局的代码路径，那是实打实的工作量。
+
+### 产物放在哪，为什么和 Python 侧分开
+
+```
+FlagSparse/pytest_results/summary.json     25 个算子条目（Python 侧）
+c_fs/capi_results/summary.json             40 个变体条目（C API 侧）
+c_fs/capi_results/result.html              同上，变体粒度的表格
+```
+
+**同名不同粒度**，所以分目录：共用一个目录意味着后写的静默覆盖先写的；而 CI 是按目录
+整个上传的，分开才能两份都留住。
+
+`summary.json` 的 `result` **按变体名做键**（`spmv_csr_f32_int_non`），不是按算子聚合。
+这不是另创的格式——算子列表注册修改.xlsx 的"新算子列表"本来就是这么命名的，所以 40 行
+是从格式里自然落出来的，FlagGems 那套 json/html 结构一个字都不用改。
+
+HTML 没有复用 `run_flagsparse_pytest.py:2994` 的生成器，原因有两条：它吃的是 runner 的
+内存 `results` 列表而不是 `summary.json`；而且它的 `HTML_SPEEDUP_DTYPES` 是写死的元组，
+**没有 fp64 也没有复数**——这里一半的变体会无处落脚。所以布局照搬（环境表、状态过滤、
+列排序），列跟着数据走。
 
 ### 变体没测到时会怎样
 

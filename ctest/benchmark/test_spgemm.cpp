@@ -79,8 +79,19 @@ TEST(SpgemmBenchmark, CsrOverCorpus) {
     for (const auto& entry : corpus()) {
         const CsrMatrix& A = entry.A;
         if (A.rows != A.cols) {
-            g_report.skip(BenchRow{}.tag("matrix", entry.name).tag("format", "csr"),
-                          "skipped_shape", "A*A needs a square A");
+            // One row PER VARIANT, not one for the matrix. A single untagged row
+            // carries no dtype and no `reporting`, so every consumer downstream
+            // has to guess which variants it stands for -- and a summary that
+            // defaults the guess to "delivery" quietly inflates its own totals.
+            for (const registry::Variant* v : declared) {
+                BenchRow row;
+                row.name = std::string("spgemm_csr_") + v->dtype + "_" + entry.name;
+                row.tag("operator", v->op).tag("matrix", entry.name)
+                   .tag("format", v->format).tag("dtype", v->dtype)
+                   .tag("corpus", corpus_tag()).tag("reporting", v->reporting);
+                g_report.skip(std::move(row), "skipped_shape",
+                              "A*A needs a square A");
+            }
             continue;
         }
         const std::vector<double> x = dense_pattern(static_cast<std::size_t>(A.cols));

@@ -150,8 +150,9 @@ def tested_variants(bench_dir):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--bench-dir", type=pathlib.Path, default=None,
-                    help="directory of *_benchmark.json (FLAGSPARSE_BENCH_OUT)")
+    ap.add_argument("--bench-dir", type=pathlib.Path,
+                    default=pathlib.Path("capi_results"),
+                    help="directory of *_benchmark.json (default: capi_results/)")
     ap.add_argument("--strict", action="store_true")
     args = ap.parse_args()
 
