@@ -28,17 +28,21 @@ except ImportError:
 # manifest `c64` from being paired with a benchmark row tagged `c64`, which is a
 # different type.
 DTYPES = {
-    "f32":  ("FLAGSPARSE_R_32F",  "f32"),
-    "f64":  ("FLAGSPARSE_R_64F",  "f64"),
-    "c64":  ("FLAGSPARSE_C_32F",  "c32"),
-    "c128": ("FLAGSPARSE_C_64F",  "c64"),
-    "f16":  ("FLAGSPARSE_R_16F",  "f16"),
+    "f32": ("FLAGSPARSE_R_32F", "f32"),
+    "f64": ("FLAGSPARSE_R_64F", "f64"),
+    "c64": ("FLAGSPARSE_C_32F", "c32"),
+    "c128": ("FLAGSPARSE_C_64F", "c64"),
+    "f16": ("FLAGSPARSE_R_16F", "f16"),
     "bf16": ("FLAGSPARSE_R_16BF", "bf16"),
 }
 
 FORMATS = {
     "sparse_vector": "spvec",
-    "csr": "csr", "coo": "coo", "csc": "csc", "bsr": "bsr", "sell": "sell",
+    "csr": "csr",
+    "coo": "coo",
+    "csc": "csc",
+    "bsr": "bsr",
+    "sell": "sell",
 }
 
 
@@ -98,19 +102,18 @@ def main():
         "namespace fstest::registry {",
         "",
         "struct Variant {",
-        "    const char* op;       // manifest id, e.g. \"spmv_csc\"",
-        "    const char* family;   // benchmark binary, e.g. \"spmv\"",
-        "    const char* format;   // row tag, e.g. \"csc\"",
-        "    const char* dtype;    // row tag, e.g. \"c32\"",
+        '    const char* op;       // manifest id, e.g. "spmv_csc"',
+        '    const char* family;   // benchmark binary, e.g. "spmv"',
+        '    const char* format;   // row tag, e.g. "csc"',
+        '    const char* dtype;    // row tag, e.g. "c32"',
         "    flagsparseDataType_t dt;",
-        "    const char* reporting;  // \"delivery\" or \"retained\"",
+        '    const char* reporting;  // "delivery" or "retained"',
         "};",
         "",
         "inline constexpr Variant kVariants[] = {",
     ]
     for op, fam, ftag, dtag, enum, scope in rows:
-        lines.append(
-            f'    {{"{op}", "{fam}", "{ftag}", "{dtag}", {enum}, "{scope}"}},')
+        lines.append(f'    {{"{op}", "{fam}", "{ftag}", "{dtag}", {enum}, "{scope}"}},')
     lines += [
         "};",
         "",

@@ -56,15 +56,24 @@ def geomean(vals):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--bench-dir", type=pathlib.Path,
-                    default=pathlib.Path("capi_results"),
-                    help="directory of *_benchmark.json (default: capi_results/)")
+    ap.add_argument(
+        "--bench-dir",
+        type=pathlib.Path,
+        default=pathlib.Path("capi_results"),
+        help="directory of *_benchmark.json (default: capi_results/)",
+    )
     ap.add_argument("--csv", type=pathlib.Path)
-    ap.add_argument("--all", action="store_true",
-                    help="include retained variants; default is the delivery "
-                         "list only (算子列表注册修改.xlsx)")
-    ap.add_argument("--by-matrix", action="store_true",
-                    help="one row per (variant, matrix) instead of aggregating")
+    ap.add_argument(
+        "--all",
+        action="store_true",
+        help="include retained variants; default is the delivery "
+        "list only (算子列表注册修改.xlsx)",
+    )
+    ap.add_argument(
+        "--by-matrix",
+        action="store_true",
+        help="one row per (variant, matrix) instead of aggregating",
+    )
     args = ap.parse_args()
 
     rows = load_rows(args.bench_dir)
@@ -81,9 +90,18 @@ def main():
     # Group by variant. The n/k sweeps inside an operator are folded together
     # here: they are the same variant measured at several widths, and separating
     # them would make the list longer than the operator list it is reporting.
-    key = (lambda r: (r["_op"], r.get("format", "?"), r.get("dtype", "?"),
-                      r.get("matrix", "?"))) if args.by_matrix else \
-          (lambda r: (r["_op"], r.get("format", "?"), r.get("dtype", "?")))
+    key = (
+        (
+            lambda r: (
+                r["_op"],
+                r.get("format", "?"),
+                r.get("dtype", "?"),
+                r.get("matrix", "?"),
+            )
+        )
+        if args.by_matrix
+        else (lambda r: (r["_op"], r.get("format", "?"), r.get("dtype", "?")))
+    )
 
     groups = collections.OrderedDict()
     for r in rows:
@@ -91,12 +109,16 @@ def main():
 
     scope = "all variants" if args.all else "delivery list"
     print(f"backend {backend} ({arch})   baseline {baseline}   scope: {scope}")
-    print(f"{len(groups)} variants from {len(rows)} rows"
-          + (f"   ({held} rows held back as retained; --all to include)"
-             if held else "") + "\n")
+    print(
+        f"{len(groups)} variants from {len(rows)} rows"
+        + (f"   ({held} rows held back as retained; --all to include)" if held else "")
+        + "\n"
+    )
 
-    hdr = f"{'operator':<9}{'fmt':<6}{'dtype':<6}{'accuracy':>12}{'worst_err':>11}" \
-          f"{'speedup':>10}{'range':>17}{'status':>10}"
+    hdr = (
+        f"{'operator':<9}{'fmt':<6}{'dtype':<6}{'accuracy':>12}{'worst_err':>11}"
+        f"{'speedup':>10}{'range':>17}{'status':>10}"
+    )
     print(hdr)
     print("-" * len(hdr))
 
@@ -122,28 +144,41 @@ def main():
         acc = f"{len(passed)}/{len(checked)}" if checked else "unchecked"
         rng = f"{min(sp):.2f}–{max(sp):.2f}" if len(sp) > 1 else ""
         status = "ok" if ok else (bad[0].get("status") if bad else "acc-fail")
-        print(f"{op:<9}{fmt:<6}{dt:<6}{acc:>12}"
-              f"{(f'{worst:.3g}' if worst is not None else '-'):>11}"
-              f"{(f'{gm:.3f}' if gm else '-'):>10}{rng:>17}{status:>10}")
-        out_csv.append({
-            "operator": op, "format": fmt, "dtype": dt,
-            "matrices_checked": len(checked), "matrices_passed": len(passed),
-            "worst_error_ratio": worst,
-            "speedup_geomean": gm,
-            "speedup_min": min(sp) if sp else None,
-            "speedup_max": max(sp) if sp else None,
-            "status": status,
-        })
+        print(
+            f"{op:<9}{fmt:<6}{dt:<6}{acc:>12}"
+            f"{(f'{worst:.3g}' if worst is not None else '-'):>11}"
+            f"{(f'{gm:.3f}' if gm else '-'):>10}{rng:>17}{status:>10}"
+        )
+        out_csv.append(
+            {
+                "operator": op,
+                "format": fmt,
+                "dtype": dt,
+                "matrices_checked": len(checked),
+                "matrices_passed": len(passed),
+                "worst_error_ratio": worst,
+                "speedup_geomean": gm,
+                "speedup_min": min(sp) if sp else None,
+                "speedup_max": max(sp) if sp else None,
+                "status": status,
+            }
+        )
 
     overall = geomean(all_speedups)
     print("-" * len(hdr))
-    print(f"{n_variant_ok}/{len(groups)} variants fully passing; "
-          f"{n_pass} variant-matrix pairs accurate")
+    print(
+        f"{n_variant_ok}/{len(groups)} variants fully passing; "
+        f"{n_pass} variant-matrix pairs accurate"
+    )
     if overall:
-        print(f"overall speedup geomean {overall:.3f}x vs {baseline} "
-              f"over {len(all_speedups)} accurate measurements")
-        print("  NOTE: a single geomean across a mixed corpus is the least "
-              "informative number here -- read the per-variant range column.")
+        print(
+            f"overall speedup geomean {overall:.3f}x vs {baseline} "
+            f"over {len(all_speedups)} accurate measurements"
+        )
+        print(
+            "  NOTE: a single geomean across a mixed corpus is the least "
+            "informative number here -- read the per-variant range column."
+        )
 
     if args.csv:
         with open(args.csv, "w", newline="") as fh:

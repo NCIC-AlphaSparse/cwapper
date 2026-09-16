@@ -46,8 +46,8 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 DTYPE_MANIFEST_TO_TAG = {
     "f32": "f32",
     "f64": "f64",
-    "c64": "c32",    # complex<float>   -- FLAGSPARSE_C_32F
-    "c128": "c64",   # complex<double>  -- FLAGSPARSE_C_64F
+    "c64": "c32",  # complex<float>   -- FLAGSPARSE_C_32F
+    "c128": "c64",  # complex<double>  -- FLAGSPARSE_C_64F
     "f16": "f16",
     "bf16": "bf16",
 }
@@ -82,11 +82,13 @@ def declared_variants(manifest):
         dts = op.get("dtypes") or []
         for f in fmts:
             for d in dts:
-                out.append((
-                    op["id"],
-                    FORMAT_MANIFEST_TO_TAG.get(f, f),
-                    DTYPE_MANIFEST_TO_TAG.get(d, d),
-                ))
+                out.append(
+                    (
+                        op["id"],
+                        FORMAT_MANIFEST_TO_TAG.get(f, f),
+                        DTYPE_MANIFEST_TO_TAG.get(d, d),
+                    )
+                )
     return out
 
 
@@ -150,9 +152,12 @@ def tested_variants(bench_dir):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--bench-dir", type=pathlib.Path,
-                    default=pathlib.Path("capi_results"),
-                    help="directory of *_benchmark.json (default: capi_results/)")
+    ap.add_argument(
+        "--bench-dir",
+        type=pathlib.Path,
+        default=pathlib.Path("capi_results"),
+        help="directory of *_benchmark.json (default: capi_results/)",
+    )
     ap.add_argument("--strict", action="store_true")
     args = ap.parse_args()
 
@@ -161,8 +166,10 @@ def main():
     groups = manifest["operators"]
     impl = [o for o in groups if o.get("status") == "implemented"]
     variants = declared_variants(manifest)
-    print(f"  {len(groups)} groups, {len(impl)} implemented, "
-          f"{len(variants)} declared variants\n")
+    print(
+        f"  {len(groups)} groups, {len(impl)} implemented, "
+        f"{len(variants)} declared variants\n"
+    )
 
     drift = 0
 
@@ -215,17 +222,23 @@ def main():
                 uncovered.append((oid, fmt, dt, fam or "?"))
 
         for oid, fam in undeclared_test:
-            print(f"  TESTS FIELD     {oid:<22} does not list "
-                  f"benchmark/test_{fam}.cpp (inferred it)")
+            print(
+                f"  TESTS FIELD     {oid:<22} does not list "
+                f"benchmark/test_{fam}.cpp (inferred it)"
+            )
         for oid, fmt, dt, fam in uncovered:
-            print(f"  NOT MEASURED    {oid:<22} {fmt}/{dt}  "
-                  f"(expected a row in {fam}_benchmark.json)")
+            print(
+                f"  NOT MEASURED    {oid:<22} {fmt}/{dt}  "
+                f"(expected a row in {fam}_benchmark.json)"
+            )
         # The other direction: rows nobody declared.
         declared_set = {(fam_of.get(o), f, d) for o, f, d in variants}
         extra = [k for k in tested if k not in declared_set]
         for fam, fmt, dt in sorted(extra):
-            print(f"  UNDECLARED ROW  {fam:<22} {fmt}/{dt}  "
-                  f"(measured, but the manifest does not declare it)")
+            print(
+                f"  UNDECLARED ROW  {fam:<22} {fmt}/{dt}  "
+                f"(measured, but the manifest does not declare it)"
+            )
         n = len(undeclared_test) + len(uncovered) + len(extra)
         print(f"  {n} disagreements\n" if n else "  manifest and rows agree\n")
         drift += n
@@ -240,10 +253,13 @@ def main():
         deliv += len(op.get("formats") or []) * len(dts)
         for g in op.get("delivery_gaps") or []:
             gaps += 1
-            print(f"  GAP  {op['id']:<22} {g}  declared in the delivery list, "
-                  f"no kernel")
-    print(f"  {deliv} delivery variants generated, {gaps} asked for but "
-          f"not implemented ({deliv + gaps} in the delivery list)\n")
+            print(
+                f"  GAP  {op['id']:<22} {g}  declared in the delivery list, no kernel"
+            )
+    print(
+        f"  {deliv} delivery variants generated, {gaps} asked for but "
+        f"not implemented ({deliv + gaps} in the delivery list)\n"
+    )
 
     print("== summary ==")
     print(f"  {drift} disagreement(s) between the manifest and the repo")

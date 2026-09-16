@@ -47,10 +47,19 @@ import sys
 
 # Verbatim from run_flagsparse_pytest.py -- if that table changes this must too.
 STATUS_TO_FLAGGEMS = {
-    "PASS": "Passed", "FAIL": "Failed", "SKIP": "Skipped", "TIMEOUT": "Timeout",
-    "NO_TESTS": "NotFound", "CRASH": "Error", "NOT_CONFIGURED": "NotFound",
-    "Passed": "Passed", "Failed": "Failed", "Skipped": "Skipped",
-    "Timeout": "Timeout", "NotFound": "NotFound", "Error": "Error",
+    "PASS": "Passed",
+    "FAIL": "Failed",
+    "SKIP": "Skipped",
+    "TIMEOUT": "Timeout",
+    "NO_TESTS": "NotFound",
+    "CRASH": "Error",
+    "NOT_CONFIGURED": "NotFound",
+    "Passed": "Passed",
+    "Failed": "Failed",
+    "Skipped": "Skipped",
+    "Timeout": "Timeout",
+    "NotFound": "NotFound",
+    "Error": "Error",
 }
 
 # The C tests tag dtypes by component width (c32 = complex<float>); FlagGems
@@ -102,6 +111,9 @@ def flag_gems_dtype(d):
 def env_info(rows):
     """The strict FlagGems env block, filled from this machine and the JSONs."""
     backend = rows[0].get("_backend", "") if rows else ""
+    # The adaptor's arch string (e.g. "120"). Used as the device-name fallback
+    # below: on a backend with no nvidia-smi it is the only device fact the JSONs
+    # carry, and an empty device_name reads as "no device" rather than "unnamed".
     arch = rows[0].get("_arch", "") if rows else ""
     try:
         os_release = platform.freedesktop_os_release()
@@ -112,13 +124,19 @@ def env_info(rows):
     # the `env` block of every benchmark JSON already carries.
     device_name = ""
     try:
-        out = subprocess.run(["nvidia-smi", "--query-gpu=name",
-                              "--format=csv,noheader"],
-                             capture_output=True, text=True, timeout=10)
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
         if out.returncode == 0:
             device_name = out.stdout.strip().splitlines()[0].strip()
     except Exception:
         pass
+
+    if not device_name and arch:
+        device_name = f"{backend} arch {arch}"
 
     return {
         "architecture": platform.machine(),
@@ -156,22 +174,35 @@ def shape_key(row):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--bench-dir", type=pathlib.Path,
-                    default=pathlib.Path("capi_results"),
-                    help="directory of *_benchmark.json (default: capi_results/)")
+    ap.add_argument(
+        "--bench-dir",
+        type=pathlib.Path,
+        default=pathlib.Path("capi_results"),
+        help="directory of *_benchmark.json (default: capi_results/)",
+    )
     # Defaults to capi_results/ beside pytest_results/, which is where the
     # Python runner writes. Two reasons it is a separate directory rather than a
     # shared one: the two summaries are the same FILENAME with different
     # granularity (25 operators there, the delivery variants here), so sharing a
     # directory means one silently overwrites the other; and CI uploads whole
     # directories, so separate names keep both artifacts.
-    ap.add_argument("--out", type=pathlib.Path, default=pathlib.Path("capi_results"),
-                    help="output directory (default: capi_results/)")
-    ap.add_argument("--no-html", action="store_true",
-                    help="skip result.html (the JSON is still written)")
-    ap.add_argument("--all", action="store_true",
-                    help="include retained variants; the default is the "
-                         "delivery list only (算子列表注册修改.xlsx)")
+    ap.add_argument(
+        "--out",
+        type=pathlib.Path,
+        default=pathlib.Path("capi_results"),
+        help="output directory (default: capi_results/)",
+    )
+    ap.add_argument(
+        "--no-html",
+        action="store_true",
+        help="skip result.html (the JSON is still written)",
+    )
+    ap.add_argument(
+        "--all",
+        action="store_true",
+        help="include retained variants; the default is the "
+        "delivery list only (算子列表注册修改.xlsx)",
+    )
     args = ap.parse_args()
 
     files = sorted(args.bench_dir.glob("*_benchmark.json"))
@@ -196,9 +227,11 @@ def main():
         if not args.all:
             untagged = [r for r in rows if "reporting" not in r]
             if untagged:
-                print(f"  {path.name}: {len(untagged)} rows carry no `reporting` "
-                      f"tag (built before it existed) -- excluded; rerun that "
-                      f"operator, or pass --all")
+                print(
+                    f"  {path.name}: {len(untagged)} rows carry no `reporting` "
+                    f"tag (built before it existed) -- excluded; rerun that "
+                    f"operator, or pass --all"
+                )
             rows = [r for r in rows if r.get("reporting") == "delivery"]
         all_rows.extend(rows)
         if not rows:
@@ -230,12 +263,14 @@ def main():
             va = acc_by_variant.get(vname, vrows)
             # pass_relaxed counts as passed: spec 6.3.1 calls it a PASS, and it
             # is only awarded when the vendor missed the strict tolerance too.
-            v_passed = [r for r in va
-                        if r.get("accuracy") in ("pass", "pass_relaxed")]
+            v_passed = [r for r in va if r.get("accuracy") in ("pass", "pass_relaxed")]
             v_failed = [r for r in va if r.get("accuracy") == "fail"]
-            v_skipped = [r for r in va
-                         if str(r.get("status", "")).startswith("skipped")
-                         or r.get("status") == "not_supported"]
+            v_skipped = [
+                r
+                for r in va
+                if str(r.get("status", "")).startswith("skipped")
+                or r.get("status") == "not_supported"
+            ]
 
             dt = flag_gems_dtype(vrows[0].get("dtype", "?"))
             det, sp = {}, []
@@ -253,11 +288,15 @@ def main():
             v_details = {}
             if v_failed:
                 v_details["failed"] = [
-                    {"name": r.get("name"), "error_ratio": r.get("error_ratio"),
-                     "detail": r.get("detail")} for r in v_failed]
+                    {
+                        "name": r.get("name"),
+                        "error_ratio": r.get("error_ratio"),
+                        "detail": r.get("detail"),
+                    }
+                    for r in v_failed
+                ]
 
-            acc_status = ("Failed" if v_failed
-                          else ("Passed" if v_passed else "Skipped"))
+            acc_status = "Failed" if v_failed else ("Passed" if v_passed else "Skipped")
             result[vname] = {
                 "customized": True,
                 "accuracy": {
@@ -275,15 +314,18 @@ def main():
                     "duration": 0.0,
                     "exit_code": 0,
                     "data_file": path.name,
-                    "data": {dt: {"result": "Passed" if sp else "Unknown",
-                                  "details": det,
-                                  "speedup": sum(sp) / len(sp) if sp else 0.0}},
+                    "data": {
+                        dt: {
+                            "result": "Passed" if sp else "Unknown",
+                            "details": det,
+                            "speedup": sum(sp) / len(sp) if sp else 0.0,
+                        }
+                    },
                     "status": flaggems_status("Passed" if sp else "Skipped"),
                     "test_case": "matrix",
                 },
                 "labels": ["flagsparse", "c_api"],
             }
-
 
     summary = {
         "timestamp": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -303,6 +345,7 @@ def main():
         try:
             sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
             import write_html
+
             html_path, n = write_html.render(summary, args.out / "result.html")
             print(f"wrote {html_path}  ({n} variants)")
         except Exception as exc:  # noqa: BLE001 - reported, never fatal

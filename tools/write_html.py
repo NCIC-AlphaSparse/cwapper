@@ -28,8 +28,13 @@ import sys
 DTYPE_COLUMNS = ("fp16", "fp32", "fp64", "c32", "c64")
 
 STATUS_CLASS = {
-    "Passed": "ok", "Failed": "bad", "Skipped": "skip",
-    "Timeout": "bad", "Error": "bad", "NotFound": "skip", "Unknown": "skip",
+    "Passed": "ok",
+    "Failed": "bad",
+    "Skipped": "skip",
+    "Timeout": "bad",
+    "Error": "bad",
+    "NotFound": "skip",
+    "Unknown": "skip",
 }
 
 CSS = """
@@ -118,8 +123,10 @@ def speedup_cell(value):
 
 def env_table(env):
     rows = []
+
     def add(k, v):
         rows.append(f"<tr><td>{esc(k)}</td><td>{esc(v)}</td></tr>")
+
     for k in ("architecture", "os_name", "os_release", "python"):
         add(k, env.get(k, ""))
     t = env.get("torch") or {}
@@ -168,9 +175,12 @@ def render(doc, out_path):
         if det.get("failed"):
             items = "\n".join(
                 esc(f"{d.get('name')}  error_ratio={d.get('error_ratio')}")
-                for d in det["failed"])
-            detail_html = (f"<details><summary>{failed} failing</summary>"
-                           f"<pre>{items}</pre></details>")
+                for d in det["failed"]
+            )
+            detail_html = (
+                f"<details><summary>{failed} failing</summary>"
+                f"<pre>{items}</pre></details>"
+            )
 
         cells = "".join(speedup_cell(per_dtype.get(dt)) for dt in DTYPE_COLUMNS)
         body.append(
@@ -178,33 +188,35 @@ def render(doc, out_path):
             f'data-name="{esc(name.lower())}">'
             f'<td class="num" data-sort="{i}">{i}</td>'
             f'<td data-sort="{esc(name)}">{esc(name)}</td>'
-            f'<td data-sort="{esc(acc_status)}" class="{STATUS_CLASS.get(acc_status,"skip")}">'
-            f'{esc(acc_status)}{detail_html}</td>'
+            f'<td data-sort="{esc(acc_status)}" class="{STATUS_CLASS.get(acc_status, "skip")}">'
+            f"{esc(acc_status)}{detail_html}</td>"
             f'<td data-sort="{passed}">{passed}/{failed}/{skipped}</td>'
-            f'<td data-sort="{esc(perf_status)}" class="{STATUS_CLASS.get(perf_status,"skip")}">'
-            f'{esc(perf_status)}</td>'
-            f'{speedup_cell(avg)}'
-            f'{cells}'
-            "</tr>")
+            f'<td data-sort="{esc(perf_status)}" class="{STATUS_CLASS.get(perf_status, "skip")}">'
+            f"{esc(perf_status)}</td>"
+            f"{speedup_cell(avg)}"
+            f"{cells}"
+            "</tr>"
+        )
 
     dtype_headers = "".join(
-        f'<th>{dt}<br>'
-        f'<button class="sort-btn" onclick="sortTable({6+j},\'asc\')">&#9650;</button>'
-        f'<button class="sort-btn" onclick="sortTable({6+j},\'desc\')">&#9660;</button>'
-        f'</th>'
-        for j, dt in enumerate(DTYPE_COLUMNS))
+        f"<th>{dt}<br>"
+        f'<button class="sort-btn" onclick="sortTable({6 + j},\'asc\')">&#9650;</button>'
+        f'<button class="sort-btn" onclick="sortTable({6 + j},\'desc\')">&#9660;</button>'
+        f"</th>"
+        for j, dt in enumerate(DTYPE_COLUMNS)
+    )
 
     doc_html = f"""<!doctype html>
 <meta charset="utf-8">
 <title>FlagSparse C API — {len(result)} variants</title>
 <style>{CSS}</style>
 <h1>FlagSparse C API 测试结果</h1>
-<div class="sub">{esc(doc.get('timestamp',''))} &nbsp;|&nbsp; 基线 cuSPARSE &nbsp;|&nbsp;
+<div class="sub">{esc(doc.get("timestamp", ""))} &nbsp;|&nbsp; 基线 cuSPARSE &nbsp;|&nbsp;
 交付清单 {len(result)} 个变体（算子列表注册修改.xlsx）</div>
 
 <table>
 <thead><tr><th>Env</th><th>Setting</th></tr></thead>
-<tbody>{env_table(doc.get('env') or {})}</tbody>
+<tbody>{env_table(doc.get("env") or {})}</tbody>
 </table>
 
 <div class="controls">
@@ -241,17 +253,23 @@ def render(doc, out_path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--results-dir", type=pathlib.Path,
-                    default=pathlib.Path("capi_results"))
-    ap.add_argument("--out", type=pathlib.Path, default=None,
-                    help="default: <results-dir>/result.html")
+    ap.add_argument(
+        "--results-dir", type=pathlib.Path, default=pathlib.Path("capi_results")
+    )
+    ap.add_argument(
+        "--out",
+        type=pathlib.Path,
+        default=None,
+        help="default: <results-dir>/result.html",
+    )
     args = ap.parse_args()
 
     path = args.results_dir / "summary.json"
     if not path.exists():
         sys.exit(f"{path} not found -- run tools/write_summary.py first")
-    out, n = render(json.loads(path.read_text()),
-                    args.out or (args.results_dir / "result.html"))
+    out, n = render(
+        json.loads(path.read_text()), args.out or (args.results_dir / "result.html")
+    )
     print(f"wrote {out}  ({n} variants)")
 
 
